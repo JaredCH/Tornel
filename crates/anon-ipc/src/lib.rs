@@ -32,6 +32,7 @@ pub mod dto;
 pub mod error;
 
 pub use commands::Backend;
+pub use dto::PrivacyView;
 pub use dto::{
     AddMemberOutcome, ConsentPrompt, ConsentSubmission, ConversationView, DeliveryState,
     GroupMemberView, GroupView, IdentityView, MessageView, PeerView, ProposalView,
@@ -78,6 +79,9 @@ impl std::fmt::Display for SecretHandle {
 /// with a test that reads the DTO sources, so drift is detected.
 pub fn dto_inventory() -> Vec<&'static str> {
     vec![
+        "restricted_discovery",
+        "legacy_contacts",
+        "traffic_shaping",
         // IdentityView
         "contact_code",
         "fingerprint",

@@ -256,6 +256,32 @@ fn reading_an_unknown_message_fails_cleanly() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn expired_message_cannot_be_read_before_purge_with_a_live_bucket() {
+    let dir = tempdir::TempDir::new("expired-read");
+    let mut store = open(&dir);
+    let expired = store
+        .insert_message(b"conv", b"peer", NOW, b"older")
+        .unwrap();
+    store.freeze_clock_at(NOW + DAY);
+    let live = store
+        .insert_message(b"conv", b"peer", NOW + DAY, b"newer")
+        .unwrap();
+
+    store.freeze_clock_at(NOW + anon_core::RETENTION_SECONDS - 1);
+    assert_eq!(store.read_message(&expired).unwrap(), b"older");
+    store.freeze_clock_at(NOW + anon_core::RETENTION_SECONDS);
+    assert!(matches!(
+        store.read_message(&expired),
+        Err(anon_storage::StorageError::InvalidRecord(_))
+    ));
+    assert_eq!(store.read_message(&live).unwrap(), b"newer");
+    assert_eq!(store.message_count().unwrap(), 2);
+    assert!(store
+        .key_ring()
+        .is_live(&anon_storage::BucketId::from_epoch(NOW)));
+}
+
+#[test]
 fn inserting_an_already_expired_record_is_rejected() {
     // plan.md §6.5(3): a row must not be insertable in an immortal state.
     let dir = tempdir::TempDir::new("expired-insert");

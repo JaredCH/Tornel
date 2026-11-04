@@ -9,6 +9,10 @@ license.workspace = true
 anon-core.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+x25519-dalek.workspace = true
+data-encoding = "2"
 # Diagnostics. Arti emits its bootstrap stages as `tracing` events; without the facade
 # linked here those events are compiled out of our view and a stuck bootstrap is
 # indistinguishable from a silent one (Gap 3).
@@ -54,15 +58,18 @@ arti-client = { version = "0.47.0", optional = true, features = [
 # its internal module layout, which is exactly what §3.4 warns about.
 tor-rtcompat = { version = "0.47.0", optional = true, features = ["tokio", "native-tls"] }
 # Onion-service configuration types (`OnionServiceConfig`, `HsNickname`).
-tor-hsservice = { version = "0.47.0", optional = true }
+tor-hsservice = { version = "0.47.0", optional = true, features = ["restricted-discovery"] }
 tor-cell = { version = "0.47.0", optional = true }
 tor-persist = { version = "0.47.0", optional = true }
+tor-hscrypto = { version = "0.47.0", optional = true }
+tor-llcrypto = { version = "0.47.0", optional = true }
+tor-config = { version = "0.47.0", optional = true }
 # `HsId` (the onion service identity) intentionally has no `Display` impl so that
 # accidental logging is redacted. The full `${base32}.onion` form is opt-in via
 # `safelog::DisplayRedacted::display_unredacted`, which is how we obtain the
 # address to hand to the UI.
 safelog = { version = "0.10.0", optional = true }
-tokio = { version = "1", optional = true, features = ["io-util", "rt", "time"] }
+tokio = { version = "1", optional = true, features = ["io-util", "rt", "sync", "time", "macros"] }
 futures = { version = "0.3", optional = true }
 # Required only to unify features, not to use directly.
 #
@@ -84,6 +91,9 @@ arti = [
     "dep:tor-hsservice",
     "dep:tor-cell",
     "dep:tor-persist",
+    "dep:tor-hscrypto",
+    "dep:tor-llcrypto",
+    "dep:tor-config",
     "dep:safelog",
     "dep:tokio",
     "dep:futures",

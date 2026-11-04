@@ -173,6 +173,102 @@ fn tor_bootstraps_and_hosts_an_onion_service() {
 }
 
 #[test]
+fn restricted_discovery_blocks_unauthorized_and_shapes_authorized_traffic() {
+    if std::env::var("ANON_TOR_PRIVACY_E2E").as_deref() != Ok("1") {
+        eprintln!("skipped: set ANON_TOR_PRIVACY_E2E=1 for live privacy verification");
+        return;
+    }
+    let _deadline_guard = lock_deadline_env();
+    let root = std::env::temp_dir().join(format!(
+        "anon-privacy-e2e-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut transports = Vec::new();
+    let mut keys = Vec::new();
+    for index in 0..3 {
+        let dir = root.join(index.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        transports.push(std::sync::Arc::new(ArtiTransport::with_config(
+            anon_transport::TorConfig::none().with_data_dir(&dir),
+        )));
+        keys.push(anon_transport::DiscoveryKey::for_identity(
+            &anon_core::IdentityKeys::generate().unwrap(),
+        ));
+    }
+    let allowed = vec![keys[0].public_key(), keys[1].public_key()];
+    for index in 0..3 {
+        transports[index]
+            .configure_discovery(&keys[index], Some(&allowed))
+            .unwrap();
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    transports[1].set_inbound_handler(move |payload| {
+        let _ = sender.send(payload);
+    });
+    let workers: Vec<_> = transports
+        .iter()
+        .map(|transport| {
+            let transport = transport.clone();
+            std::thread::spawn(move || transport.start())
+        })
+        .collect();
+    for worker in workers {
+        worker
+            .join()
+            .unwrap()
+            .expect("privacy peer bootstrap and hosting");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    while transports
+        .iter()
+        .any(|transport| !transport.is_onion_service_reachable())
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::park_timeout(std::time::Duration::from_secs(1));
+    }
+    assert!(transports
+        .iter()
+        .all(|transport| transport.is_onion_service_reachable()));
+    let onion = transports[1].local_onion().unwrap();
+    let route = anon_transport::PeerRoute::onion(onion.clone());
+    assert!(
+        transports[2].send(&route, b"unauthorized").is_err(),
+        "unknown discovery key must not connect"
+    );
+    assert!(receiver.try_recv().is_err());
+    transports[0]
+        .send(&route, b"authorized")
+        .expect("authorized discovery delivery");
+    assert_eq!(
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap(),
+        b"authorized"
+    );
+    transports[1].configure_shaping(&[], true).unwrap();
+    transports[0].configure_shaping(&[onion], true).unwrap();
+    let expected = vec![42u8; 16_384];
+    transports[0]
+        .send(&route, &expected)
+        .expect("shaped delivery");
+    assert_eq!(
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap(),
+        expected
+    );
+    for transport in &transports {
+        transport.shutdown();
+    }
+    drop(transports);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn a_failed_bootstrap_reports_a_reason_rather_than_hanging() {
     // This one runs unconditionally: it does not need Tor, only the guarantee that a
     // bootstrap which cannot finish reports *something*. That guarantee is the fix for the

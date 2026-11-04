@@ -39,6 +39,10 @@ pub mod tor_config;
 pub mod arti;
 
 pub use error::{Result, TransportError};
+mod discovery;
+#[cfg(feature = "arti")]
+mod shaping;
+pub use discovery::DiscoveryKey;
 pub use logging::init_from_env as init_tracing;
 pub use route::{OnionId, PeerRoute, RouteKind};
 pub use tor_config::TorConfig;
@@ -90,6 +94,10 @@ pub enum TransportStatus {
 /// [`TransportError::NotReady`] unless the transport is `Ready` **and** its
 /// anonymity class permits internet routing.
 pub trait AnonymityTransport: Send + Sync {
+    fn start(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// The anonymity this transport provides.
     fn anonymity(&self) -> AnonymityClass;
 
@@ -106,6 +114,26 @@ pub trait AnonymityTransport: Send + Sync {
 
     /// Install a handler for complete inbound payloads received over this transport.
     fn set_inbound_handler(&self, _handler: Arc<dyn Fn(Vec<u8>) + Send + Sync>) {}
+
+    fn configure_discovery(
+        &self,
+        _key: &DiscoveryKey,
+        _authorized: Option<&[String]>,
+    ) -> Result<()> {
+        Err(TransportError::Failed(
+            "discovery configuration is unavailable on this transport".into(),
+        ))
+    }
+
+    fn configure_shaping(&self, _peers: &[OnionId], enabled: bool) -> Result<()> {
+        if enabled {
+            Err(TransportError::Failed(
+                "traffic shaping is unavailable on this transport".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
 
     /// Reason the transport failed, when `status()` is `Failed`.
     fn failure_reason(&self) -> Option<String>;
@@ -272,6 +300,18 @@ impl MockTransport {
 }
 
 impl AnonymityTransport for MockTransport {
+    fn configure_shaping(&self, _peers: &[OnionId], _enabled: bool) -> Result<()> {
+        Ok(())
+    }
+
+    fn configure_discovery(
+        &self,
+        _key: &DiscoveryKey,
+        _authorized: Option<&[String]>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn anonymity(&self) -> AnonymityClass {
         if self.tor_like {
             AnonymityClass::TorOnion

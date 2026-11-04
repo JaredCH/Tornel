@@ -23,6 +23,22 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 
+.persona-controls { margin-bottom: 16px; }
+.persona-controls .row { flex-wrap: wrap; }
+.persona-controls input, .persona-controls select { min-width: 0; flex: 1 1 160px; }
+.persona-controls select {
+  max-width: 100%;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px;
+  font: inherit;
+}
+.privacy-option { display: flex; align-items: center; gap: 10px; margin: 12px 0; }
+.privacy-option input { width: 18px; height: 18px; flex: 0 0 18px; }
+#invite-bundle { display: block; max-height: 96px; overflow: auto; overflow-wrap: anywhere; white-space: normal; }
+
 html, body {
   margin: 0;
   height: 100%;
@@ -38,11 +54,12 @@ html, body {
 
 .launch {
   display: flex;
-  align-items: center;
+  align-items: safe center;
   justify-content: center;
   height: 100%;
   width: 100%;
   padding: 24px;
+  overflow: auto;
   background: radial-gradient(circle at 50% 20%, #1c1836 0%, var(--bg) 70%);
 }
 

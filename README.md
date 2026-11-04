@@ -1,6 +1,6 @@
 # Tornel (`anon`) — Serverless, 100% Tor v3 Onion P2P Messenger
 
-A Rust + Tauri v2 desktop and mobile communication application built around **zero application-operated servers**, **100% Tor v3 onion-service rendezvous routing** (via embedded Arti), **authenticated end-to-end encryption** (X25519 + Ed25519 for 1-on-1, RFC 9420 MLS for groups with role-based permissions), **encrypted image sharing with mandatory attachment sanitization**, and **local-only SQLCipher storage with a mandatory 90-day crypto-shredding retention ceiling**.
+A Rust + Tauri v2 desktop and mobile communication application built around **zero application-operated servers**, **Tor v3 onion-service rendezvous routing** (via embedded Arti), **authenticated end-to-end encryption** (X25519 + Ed25519 for 1-on-1, RFC 9420 MLS for groups), **encrypted image sharing with mandatory attachment sanitization**, and **local-only SQLCipher storage with an automatic 90-day retention policy**. Group role authorization and forensic key erasure remain incomplete; see the risks below.
 
 > **Security Status & Audit Notice:** Embedded Arti bootstrap, v3 onion-service descriptor publication, and authenticated two-peer 1-on-1 and MLS group message/attachment delivery over Tor rendezvous have been verified end-to-end (both standalone and alongside an active Tor Browser daemon on ports `9150`/`9151`). However, this software has not yet undergone a formal third-party cryptographic or network-anonymity audit. Review the **Mitigated vs. Remaining Risks** section below before relying on it in high-adversary environments.
 
@@ -21,9 +21,11 @@ Overstating protection in an anonymity tool is itself a hazard (`plan.md` §2.4,
 | **Exposing your IP address to a chat peer or group member** | **Bidirectional Tor v3 Onion Rendezvous.** Every running instance hosts its own Tor v3 hidden service via embedded Arti. Outbound and inbound connections meet at a Tor Rendezvous Point over a 6-hop onion circuit—neither peer ever learns the other's IP address or physical network location. |
 | **Phone number, email, or username correlation** | **Self-Sovereign Cryptographic Identity.** No phone numbers, emails, or global usernames exist. Your identity is an Ed25519 signing keypair + X25519 agreement keypair generated locally from OS entropy and encoded into a self-checksummed Bech32m contact code (`anon1…`). Display names are strictly local labels. |
 | **Coexistence conflicts with Tor Browser or system Tor** | **Isolated Embedded Arti Runtime.** The app embeds Arti directly with `SocksPort 0` / `ControlPort 0` and per-profile state (`<data_dir>/arti/state` and `arti/cache`). It works whether or not Tor is installed on the host and never collides with an active Tor Browser session on ports `9150`/`9151` or `9050`/`9051`. |
-| **Ciphertext length analysis (distinguishing short messages from files/images)** | **Fixed-Bucket AEAD Frame Padding.** Every wire frame (text, image, file, or MLS payload) is padded prior to encryption into fixed size buckets (`512 B`, `2 KiB`, `8 KiB`, `32 KiB`, `128 KiB`, `512 KiB`) with the bucket authenticated in the ChaCha20-Poly1305 AEAD header. |
+| **Ciphertext length analysis (partial mitigation)** | **Fixed-Bucket AEAD Frame Padding.** Frames use fixed size buckets (`512 B`, `2 KiB`, `8 KiB`, `32 KiB`, `128 KiB`, `512 KiB`). This reduces size granularity, not timing or volume correlation. The authenticated application header still contains the true payload length; padding does not hide it from anyone able to inspect that header. |
 | **Disk forensics &stolen data directory backups** | **User-Held Passphrase + OS Keychain.** The SQLCipher database key is derived via Argon2id (`64 MiB`, 3 passes) from a passphrase you enter at launch—never stored on disk. The identity seed is stored in the OS Keychain (Windows Credential Manager / macOS Keychain / Linux Secret Service). |
-| **Historical data retention & SSD wear-leveling recovery** | **Mandatory 90-Day TTL + Monthly Crypto-Shredding.** Every content table (`messages`, `conversations`, `attachments`, `mailbox_buffer`, `consent_log`) enforces `STRICT` integer `expires_at` deadlines. Beyond SQL `DELETE` + `VACUUM`, row ciphertexts are encrypted under per-month HKDF bucket keys that are permanently destroyed once a month ages past 90 days, rendering surviving flash blocks undecryptable. |
+| **Historical data retention during normal application use** | **Automatic TTL enforcement.** Content tables carry integer `expires_at` deadlines. The app purges on unlock and every 24 hours; message reads reject expired rows even between purges. Monthly bucket retirement blocks normal key lookup. This is logical retention, **not guaranteed forensic erasure**: bucket keys can be re-derived from the master key. |
+| **Public-onion stream exhaustion (partial mitigation)** | **Automatic bounded ingress.** At most 16 application stream handlers run concurrently, with a 30-second deadline covering stream acceptance, reading, and receipt writing. Payloads are capped at 524,352 bytes; synchronous processing runs off the Tor runtime workers while retaining its slot. Excess streams are dropped without prompting the user. Tor rendezvous work, sustained floods, and abuse by authenticated contacts remain risks. |
+| **Stalled sends and false transport success** | **Bounded outbound exchange.** Connect/write/receipt work has a 120-second overall deadline, with a 30-second receipt wait. Missing or invalid receipts fail the send. The receipt confirms frame arrival only, not authentication, persistence, or reading by the recipient. |
 | **Compromised or removed group member reading future messages** | **RFC 9420 MLS Ratcheting + Human-in-the-Loop Consent.** Group membership changes advance the MLS epoch and derive fresh tree secrets (`openmls`), locking removed leaves out of future messages. Sensitive rotations trigger a nonce-bound, Ed25519-signed consent modal before taking effect. |
 | **Embedded attachment metadata and original filenames** | **Mandatory fail-closed sanitization before sending.** JPEG/PNG images are decoded and rebuilt as new JPEGs without source EXIF/GPS, XMP, ICC, comments, thumbnails, trailing data, or original filenames. Unsupported files are rejected, never passed through unchanged. |
 
@@ -31,16 +33,108 @@ Overstating protection in an anonymity tool is itself a hazard (`plan.md` §2.4,
 
 | Remaining Risk | Why It Exists & What You Must Consider |
 | --- | --- |
-| **Global Passive Adversary / End-to-End Timing & Volume Correlation** | **Tor is a low-latency anonymity network.** While frames are padded to fixed byte buckets, an adversary observing both your network link (or Guard node) and your peer's network link at the same time can correlate packet burst timing and volume. Tornel does **not** generate constant-rate cover traffic (chaff). |
+| **Previously published identity seed (urgent operational action)** | An earlier version of this README included a complete seed from a real keychain migration transcript. It has been redacted here, but existing repository history and copies may retain it. Treat that identity as compromised: stop using it, replace it through an explicit identity-change workflow, and verify the replacement contact code with contacts over a trusted channel. Redaction alone does not revoke a key. |
+| **Forensic recovery after expiry (high priority)** | Monthly keys are `HKDF(master, bucket label)`. Retiring a label does not destroy the derivation secret. Someone with a recovered database snapshot and its passphrase/master key can regenerate old keys. Real cryptographic erasure needs a reviewed, versioned key-management migration with non-regenerable keys and an explicit policy for backups, WAL files, and storage remnants. |
+| **No forward secrecy for direct messages (high priority)** | Direct-message keys derive from persistent X25519 identity keys plus public conversation/epoch values. Changing the epoch alone does not erase the ability to derive past keys. Compromise of an identity agreement key can expose captured past direct-message frames. A maintained, audited ratcheting protocol with durable state is needed; MLS group ratcheting does not protect direct chats. |
+| **Inbound group roles and sender attribution (high priority)** | MLS authenticates a group member, but the application receiver uses a sender code inside the plaintext and applies role-control messages without checking that sender's authority. Group role UI restrictions are not a security boundary against a modified client. Bind application attribution to the authenticated MLS sender and enforce role/membership permissions on receipt before relying on group roles. |
+| **Replay across restarts and timestamp renewal (high priority)** | The application replay cache is memory-only and clears when full. Captured valid direct frames may be accepted again after restart/eviction. The receiver also clamps old signed timestamps to a recent time, potentially renewing their local retention. Persist deduplication atomically with message storage and enforce authenticated timestamp expiry; the lower-level receiver also needs authentication before cache mutation. |
+| **Global Passive Adversary / End-to-End Timing & Volume Correlation** | **Tor is a low-latency anonymity network.** Optional experimental shaping emits fixed-size data/cover records on persistent streams, but does not guarantee constant Tor packet timing or defeat a global observer. Connection starts/stops, congestion, outages, and processing still leak information. Shaping is off by default and expensive; see Network Privacy below. |
 | **ISP / Local Network Detection of Tor Usage** | While your ISP cannot see *who* you are talking to or *what* onion service you connect to, they can see that you are connecting to public Tor relays unless you configure **Tor Bridges** (`Bridge obfs4 …` + `UseTransport` in `tor.conf` or `ANON_TOR_BRIDGES`). If bridges are configured, Tornel fails closed if they are unreachable rather than falling back to direct Tor relays. |
-| **Long-Lived Identity & `.onion` Linkability Across Contacts** | By default, an install uses a single persistent contact code (`anon1…`) and a single persistent v3 `.onion` service (`ONION_SERVICE_NICKNAME = "anon"`). If you share the same Invite Bundle with two different people, or post it publicly, they can prove they are talking to the same pseudonymous entity. Use separate profile directories (`ANON_DATA_DIR`) when you require unlinkable personas. |
-| **Public v3 Onion Reachability (Lack of Per-Peer Client Auth — D8)** | Standard v3 onion descriptors are encrypted on HsDirs using the public `.onion` address key. Anyone who possesses your 56-character `.onion` address can attempt to open a rendezvous stream to your service (though unauthenticated frames are dropped before touching storage). Restricted-discovery Tor client authorization (`KS_hsc_desc_enc`) is not yet wired. |
+| **Long-Lived Identity & `.onion` Linkability Across Contacts** | Each persona retains a stable contact code, onion address, and discovery public key. Sharing its signed invite with multiple people links that persona across them. The desktop persona controls create separate processes, identities, databases, Arti state, and WebView profiles; they do not undo past disclosures or prevent correlation through shared content, groups, or timing. |
+| **Onion Reachability and Authorized-Peer Abuse** | New desktop profiles enable Arti restricted discovery before hosting. Legacy profiles remain public until explicitly migrated using mutual signed invitations. Knowing a restricted onion address alone is insufficient to fetch its descriptor. Authorized peers can still abuse bounded ingress, and cached introduction points can outlive authorization changes. Discovery protection is not application authorization or immediate revocation. |
 | **Endpoint Compromise / Malware on an Unlocked Device** | SQLCipher and the OS Keychain protect data **at rest**. While the application is unlocked and running, decrypted keys and message plaintexts necessarily exist in process memory (mitigated on drop via `zeroize`, but exposed to root/user-level malware, screen capture, or memory dumps while live). |
 | **Visual Identification and Camera Fingerprints** | Mandatory metadata removal, cropping, resampling, mild blur and tonal changes do **not** guarantee anonymity or defeat sensor-pattern noise (PRNU), steganography, perceptual matching, or forensic device attribution. Faces, landmarks, watermarks, visible text, and captions can still identify you. This processing has not been validated against camera-attribution datasets. |
 | **Non-Repudiation (No Plausible Deniability)** | Direct messages are signed with your Ed25519 identity key (`ANM1` envelope) and group messages are signed with your MLS leaf signature key to prevent forgery and impersonation. A recipient who decrypts a message can cryptographically prove to a third party that your public key signed it (`plan.md` §9.5, §13). |
 | **Asynchronous Offline Delivery Requires Online Rendezvous** | Because there are no central servers, sending a direct or group message requires both the sender's and recipient's Tor v3 onion services to be online simultaneously (until peer-hosted mailbox sync is wired to automatic background polling). |
 
 ---
+
+### Hardening Review (2026-11-04)
+
+Baseline hardening implemented without new prompts or wire-format changes:
+
+- Bounded inbound concurrency, stream deadlines, and off-runtime message processing.
+- Validated transport receipts and an overall outbound deadline.
+- Expiry checks on direct storage reads, independent of the purge schedule.
+
+Next priorities are authenticated group authorization, durable replay/timestamp
+enforcement, direct-message ratcheting, and a migration for genuine key erasure.
+These should run automatically inside the backend; users should not have to
+manage keys, clear caches, or approve routine security maintenance. Preserve
+explicit consent for membership removal and other identity-sensitive actions.
+File metadata/EXIF hardening is separate work and was not changed by this review.
+
+Do not silently rotate shared contact identities or enable expensive cover
+traffic: either can disrupt reachability or battery/network use. Restricted discovery,
+separate desktop personas, and optional shaping are now implemented as described below.
+They complement, not replace, application authorization, quotas, and replay protection.
+
+This is a source-level hardening review with local regression tests, not a formal
+cryptographic audit, live-network anonymity assessment, or complete DoS defense.
+
+## Network Privacy
+
+### Restricted Discovery
+
+New desktop vaults configure restricted discovery before starting Tor. Copy a
+**Signed Invite** from Identity & Keys and exchange invites in both directions
+over a trusted channel. Each `tornel1:` invite binds the contact identity, onion
+address, and discovery public key with an Ed25519 signature. It contains no private
+authorization key. The signature prevents alteration, not substitution of an entire
+stranger's identity; verify the contact fingerprint out of band.
+
+Existing profiles keep their public discovery mode. Re-add every saved contact
+using their signed invite, ensure they have imported yours, then enable
+**Restricted discovery**. There is no UI downgrade to public discovery. Old clients
+cannot use restricted profiles. A persona supports up to 159 imported discovery
+contacts; one additional slot is reserved for its own key before contacts exist.
+
+The discovery key is domain-separated from the identity seed and is **one key per
+persona, not per contact**. Arti stores its private client authorization key in the
+profile-local keystore. Protect that directory as sensitive local data. This release
+does not add a contact-revocation workflow; removing a key in Arti would not instantly
+invalidate previously cached introduction points anyway. Application authentication
+and resource limits remain necessary even for authorized clients.
+
+### Desktop Personas
+
+Use **Personas** on the locked launch screen or in Identity & Keys to create/open a
+named persona in a separate window. Each has its own vault passphrase setup,
+path-scoped OS-keychain identity, SQLCipher database, Arti directories, and WebView2
+data folder under `<profile>/personas/<random-id>`. Existing identities are neither
+rotated nor copied. Persona names are local, unencrypted filesystem metadata.
+
+This is desktop process/profile isolation, not protection against a compromised OS
+or a promise of unlinkability. Do not reuse invites or identifying content between
+personas that should remain separate.
+
+### Experimental Traffic Shaping
+
+Shaping is **off by default**. Both peers must explicitly enable it, with restricted
+discovery and at most four signed-invite contacts. Each peer maintains an outgoing
+stream to the other; each stream emits 4096-byte data or cover records every second
+in **each direction**, including while idle. With both streams connected, total
+sent-plus-received traffic is about **1.3 GiB/day per peer per device**, before Tor
+overhead. A maximum-size frame takes about 129 seconds just to schedule.
+
+Queues, partial frames, incoming streams, and receipt waits are bounded. Enabling
+shaping rejects ordinary inbound messages and never falls back to unshaped outbound
+delivery. An offline, busy, or non-shaping peer can therefore make sends fail.
+Disabling shaping can interrupt pending sends. The Tor status indicator does not
+indicate that every shaped peer stream is connected. Cover records are not a new
+cryptographic protocol; message authentication remains in the existing message layer.
+
+Verification includes invitation tampering, legacy migration, settings across database
+reopening, persona launch environments, record reassembly/idle cover, and browser UI
+flows with mocked IPC. A live three-client Tor test verified unauthorized rejection,
+authorized delivery, and a 16 KiB shaped transfer on 2026-11-04. This proves that path
+works, not resistance to traffic analysis. Rerun it with:
+
+```powershell
+$env:ANON_TOR_PRIVACY_E2E = "1"
+cargo test -p anon-transport --features arti --test tor_e2e restricted_discovery_blocks_unauthorized_and_shapes_authorized_traffic -- --nocapture
+Remove-Item Env:ANON_TOR_PRIVACY_E2E
+```
 
 ## Mandatory Attachment Sanitization
 
@@ -96,7 +190,7 @@ flowchart TB
     MLS --> ST
     TR --> ART["Arti (feature-gated): client + onion service"]
     TR --> OFF["OfflineTransport (fails closed)"]
-    ST --> KR["KeyRing — per-month keys, crypto-shredding"]
+    ST --> KR["KeyRing — per-month derived keys, logical retirement"]
     CORE["anon-core — keys, codes, escrow, retention"] -.-> ST
     CORE -.-> CON
     CORE -.-> IPC
@@ -107,7 +201,7 @@ flowchart TB
   | Crate | Responsibility | Plan sections |
   | --- | --- | --- |
   | `anon-core` | Ed25519/X25519 identity, Bech32m contact codes, escrow, retention math | §2, §6 |
-  | `anon-storage` | SQLCipher store, `STRICT` schema, 90-day purge, crypto-shredding, peer mailbox | §6, §4.4 |
+  | `anon-storage` | SQLCipher store, `STRICT` schema, 90-day purge, logical bucket retirement, peer mailbox | §6, §4.4 |
   | `anon-transport` | `AnonymityTransport` trait, onion routes, fail-closed gate, Arti client + onion service | §3 |
   | `anon-mls` | RFC 9420 group ratcheting over `openmls`, persisted into the same SQLCipher file | §4.2, §4.3 |
   | `anon-messaging` | Wire format, padding, replay protection, delivery, group messaging, mailbox policy | §9, §4.4 |
@@ -163,11 +257,12 @@ Fixed by:
 - purge filters the indexed `expires_at`, never a re-derived window.
 
 **`VACUUM` is not a physical erase.** It is logical compaction; flash
-wear-levelling and the FTL can retain old blocks. It is therefore *not* the
-primary control. Message ciphertext is encrypted under a **per-month data key**;
-when a month ages past the ceiling the key is destroyed, making surviving
-ciphertext **cryptographically unrecoverable** regardless of filesystem
-behaviour. `secure_delete` and `VACUUM` remain as secondary layers.
+wear-levelling and the FTL can retain old blocks. Message ciphertext uses a
+**per-month derived data key**, and retired buckets are refused by normal key
+lookup. However, the master key can still regenerate those keys. Neither this
+policy nor `secure_delete` and `VACUUM` guarantees cryptographic erasure of storage
+remnants or old backups. Independent erasable key material and a reviewed
+migration are required before claiming that guarantee.
 
 Retention covers **every** content table — messages, conversations, attachments,
 mailbox buffers, and the consent audit log — and a test fails if a new content
@@ -304,7 +399,7 @@ scripts/check-no-clearnet.ps1
 
 ## Status
 
-**Implemented and tested (344 tests in the default build, more with the feature flags, all green):**
+**Implemented and covered by automated tests:**
 
 | Area | What works |
 | --- | --- |
@@ -313,10 +408,10 @@ scripts/check-no-clearnet.ps1
 | **User-held passphrase** | The database key comes from a passphrase **you** choose and type on every launch. Nothing machine-held remains: `db.passphrase` is gone. An existing install is migrated by a **resumable copy-then-swap rekey** — the copy is opened with the new passphrase and its row counts compared against the original before anything is replaced, so a crash at any stage leaves the original intact. Verified against a **real** 256 KiB install: all 24 tables' row counts identical before and after, old key rejected, `db.passphrase` deleted |
 | Contact codes | Bech32m encode/decode, BLAKE3 checksum, version gate, low-order and undecodable key rejection |
 | Escrow | AEAD artifact with Argon2id, header bound as associated data, passphrase assessment, export/import round-trip |
-| Retention | Absolute expiry math, clock-skew resistance, boundary semantics, restart-durable live-bucket set |
-| Storage | SQLCipher store, `STRICT` schema, per-table purge, crypto-shredding key ring, schema audit |
+| Retention | Absolute expiry math, read-time expiry enforcement, boundary semantics, restart-durable live-bucket set; inbound timestamp renewal remains an open risk |
+| Storage | SQLCipher store, `STRICT` schema, per-table purge, logical bucket retirement, schema audit; forensic key erasure is not implemented |
 | Transport | `AnonymityTransport` gate, onion route validation, fail-closed `OfflineTransport`, automated no-clearnet guard |
-| Messaging | Padded frame format, AEAD header binding, replay/duplicate rejection, delivery states |
+| Messaging | Padded frame format, AEAD header binding, bounded in-memory replay/duplicate rejection, delivery states; durable replay protection remains open |
 | **Groups (MLS)** | RFC 9420 ratcheting via `openmls`: create/add/remove, epoch advance, key-package validation, join from Welcome, state persisted in the same SQLCipher file. **Removal is tested to lock the removed member out** (`removed_member_cannot_decrypt`), which is the §7.1 Phase 4 exit criterion |
 | **Group Chat & Roles UI** | Full SimpleX-style 2-pane chat workspace with a collapsible **Members & Roles** drawer (`Owner`, `Admin`, `Moderator`, `Member`), `group_roles` SQLCipher table, MLS-encrypted role sync (`set_member_role`), KeyPackage generation (`generate_key_package`), Join-from-Welcome (`join_group`), and MLS-encrypted group chat + file/image fan-out over Tor (`send_group_message`). A member removal **drafts the rotation proposal** and opens the consent modal. |
 | **Mailbox** | Peer-hosted offline buffer with per-sender byte/count quotas and a per-mailbox total cap enforced *before* any write, host-side TTL through the shared purge, AAD-bound so a host cannot rewrite recipient/sender/expiry, and receipts that can never be mistaken for delivery |
@@ -330,8 +425,8 @@ scripts/check-no-clearnet.ps1
 
 **Not yet implemented:**
 
-- **Restricted-discovery onion addresses for 1-on-1 (D8).** Ordinary v3 services
-  are hosted; restricted discovery needs per-peer Tor client-authorization key provisioning.
+- **Immediate discovery revocation and per-contact identities.** Restricted discovery
+  uses signed provisioning with a persona-scoped key; it does not supply these stronger properties.
 - **Automated background polling of peer-hosted offline mailboxes.** The `Mailbox` and `MailboxHost` storage/quota engines are implemented and tested in `anon-storage` and `anon-messaging`, but live chat delivery currently targets online peers directly over Tor rendezvous.
 
 ### The Tauri shell
@@ -444,8 +539,8 @@ completed Tor bootstrap there is nowhere to send it.
 ### The keychain migration, verified on a real install
 
 The migration was exercised against the actual data directory this machine had been
-using, not a synthetic one. Before launch it held `identity.seed` with seed
-`8e63f49f08973e54…`. After launching the app once:
+using, not a synthetic one. Before launch it held `identity.seed` (value redacted).
+After launching the app once:
 
 ```
 === after launch ===
@@ -455,10 +550,11 @@ db.passphrase      64
 identity.seed still present? False
 ```
 
-Reading the seed back out of Windows Credential Manager gave
-`8e63f49f08973e54e2c3c4f70a9053b19dfa19a906e00e698a25b8a1617d7b55` — **byte-identical
-to the file that was deleted**, so the contact code did not change. A second launch
-confirmed the identity is stable with the file gone.
+Reading the seed back out of Windows Credential Manager confirmed it was
+**byte-identical to the file that was deleted**, so the contact code did not
+change. A second launch confirmed the identity was stable with the file gone.
+The seed previously printed in this transcript must be treated as compromised;
+never include key material in verification output or documentation.
 
 The real keychain round-trip is also covered by opt-in tests
 (`ANON_KEYCHAIN_TEST=1 cargo test -p anon-app keychain::tests::the_os_keychain`), which
@@ -496,8 +592,9 @@ only. The consequence was that **every message written before an app restart
 became unreadable**, because the ring started empty and every older row looked
 like it belonged to a shredded bucket. Nothing errored at write time; the loss
 only appeared on the next launch. The set is now persisted in `live_buckets` with
-a `retired_at` column, so shredding also survives a restart instead of being
-undone by one. Both directions are pinned by regression tests
+a `retired_at` column, so logical retirement survives a restart instead of being
+undone by one. This does not prevent derivation from a recovered master key.
+Both directions are pinned by regression tests
 (`a_message_survives_a_restart_and_is_still_readable`,
 `a_shredded_bucket_is_not_resurrected_by_a_restart`).
 

@@ -432,6 +432,27 @@ impl Store {
         Ok(rows)
     }
 
+    pub fn privacy_config(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'privacy_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn set_privacy_config(&self, value: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('privacy_v1', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [value],
+        )?;
+        Ok(())
+    }
+
     /// List known contacts, most recently added first.
     pub fn contacts(&self) -> Result<Vec<ContactRow>> {
         let conn = self.conn.lock().unwrap();
@@ -926,16 +947,16 @@ impl Store {
 
     /// Decrypt a stored message by id.
     ///
-    /// Fails with [`StorageError::KeyShredded`] if the message's bucket has been
-    /// crypto-shredded, which is the correct and expected behaviour: the
-    /// ciphertext may still exist on disk, but it is unrecoverable.
+    /// Expired messages are unavailable even before the scheduled purge runs.
+    /// Retired buckets are rejected by the key ring as an additional policy check.
     pub fn read_message(&self, id: &[u8]) -> Result<Vec<u8>> {
+        let now = self.now();
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
                 "SELECT conversation, sender, sent_at, expires_at, bucket, nonce, ciphertext
-                 FROM messages WHERE id = ?1",
-                [id],
+                 FROM messages WHERE id = ?1 AND expires_at > ?2",
+                rusqlite::params![id, now],
                 |r| {
                     Ok((
                         r.get::<_, Vec<u8>>(0)?,

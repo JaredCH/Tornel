@@ -120,6 +120,13 @@ pub struct MessageView {
     pub body: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PrivacyView {
+    pub restricted_discovery: bool,
+    pub legacy_contacts: usize,
+    pub traffic_shaping: bool,
+}
+
 /// Transport status for the header (`plan.md` §3.4, §8).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TransportView {

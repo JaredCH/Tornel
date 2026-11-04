@@ -26,9 +26,9 @@
 //!
 //! # Startup
 //!
-//! [`run`] opens the encrypted store, loads or creates the identity, builds the
-//! backend, and starts the background tasks that must not live in the webview:
-//! the retention purge timer and (with the `tor` feature) the Tor bootstrap.
+//! [`run`] presents the locked vault. Creating or unlocking it builds the backend
+//! and applies saved privacy policy before starting the retention purge timer
+//! and (with the `tor` feature) the Tor bootstrap and onion service.
 //!
 //! # The identity seed lives in the OS keychain
 //!
@@ -38,14 +38,15 @@
 //! plaintext file, and **refuse to start** when the keychain is unavailable rather than
 //! falling back to a file.
 //!
-//! # The database passphrase is still machine-held
+//! # The database passphrase is user-held
 //!
-//! Closing that is Gap 2 of the gap-closure plan. Until then the app starts without a
-//! login screen, and the README says what that costs.
+//! The store remains closed until the user supplies their vault passphrase.
+//! Legacy machine-held passphrases use the explicit resumable migration flow.
 
 pub mod commands;
 pub mod identity_store;
 pub mod keychain;
+pub mod personas;
 pub mod vault;
 
 use anon_storage::{Argon2Params, Store};
@@ -172,20 +173,7 @@ pub fn build_transport(data_dir: &std::path::Path) -> Arc<dyn AnonymityTransport
                 return Arc::new(anon_transport::OfflineTransport::new(error.to_string()));
             }
         };
-        let t = Arc::new(anon_transport::arti::ArtiTransport::with_config(config));
-        // Bootstrap on a background thread: it can take minutes and must never
-        // block the UI (`plan.md` §7.3: long-running work lives in Rust tasks).
-        let bg = t.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = bg.bootstrap() {
-                eprintln!("anon: Tor bootstrap failed: {e}");
-                return;
-            }
-            if let Err(e) = bg.host_onion_service() {
-                eprintln!("anon: onion service hosting failed: {e}");
-            }
-        });
-        t
+        Arc::new(anon_transport::arti::ArtiTransport::with_config(config))
     }
     #[cfg(not(feature = "tor"))]
     {

@@ -1,0 +1,17 @@
+# Build-footprint tuning.
+#
+# Dependency debuginfo was ~13.5 GB of the debug target directory: every
+# third-party crate (Arti, OpenSSL, SQLCipher, ICU, ...) emitted a full .pdb that
+# is never stepped through. Disabling it for dependencies only keeps the
+# workspace's own crates fully debuggable, so breakpoints in `crates/` still work.
+#
+# Note this is `package."*"`, not `[profile.dev] debug = false`: the latter would
+# strip debuginfo from our own code too.
+[profile.dev.package."*"]
+debug = false
+
+# Proc macros and build scripts are compiled for the host, so they are governed
+# by `build-override` rather than `package."*"`. Without this they still emit
+# ~2.6 MB of .pdb each (serde_derive, zeroize_derive, thiserror_impl, ...).
+[profile.dev.build-override]
+debug = false

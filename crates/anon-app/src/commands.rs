@@ -81,12 +81,18 @@ impl AppState {
     /// against a store that does not exist yet would be a panic waiting to happen.
     pub fn install(&self, backend: Backend) {
         let store = backend.store().clone();
+        let transport = backend.messaging().transport().clone();
         let mut slot = self.backend.lock().unwrap();
         if let Some(old) = slot.take() {
             old.messaging().transport().shutdown();
         }
         *slot = Some(Arc::new(backend));
         crate::spawn_purge_timer(store);
+        std::thread::spawn(move || {
+            if let Err(error) = transport.start() {
+                eprintln!("anon: transport startup failed: {error}");
+            }
+        });
     }
 
     /// The backend, or a `locked` error.
@@ -209,6 +215,55 @@ pub fn export_escrow(state: State<'_, AppState>, passphrase: String) -> UiResult
 #[tauri::command(rename_all = "snake_case")]
 pub fn transport_view(state: State<'_, AppState>) -> UiResult<TransportView> {
     Ok(state.backend()?.transport_view())
+}
+
+#[tauri::command]
+pub fn privacy_view(state: State<'_, AppState>) -> UiResult<anon_ipc::PrivacyView> {
+    state.backend()?.privacy_view().map_err(UiError::from)
+}
+
+#[tauri::command]
+pub fn list_personas(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::personas::PersonaView>, String> {
+    crate::personas::list(state.data_dir())
+}
+
+#[tauri::command]
+pub fn create_persona(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<crate::personas::PersonaView, String> {
+    crate::personas::create(state.data_dir(), &name)
+}
+
+#[tauri::command]
+pub fn open_persona(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    crate::personas::open(state.data_dir(), &id)
+}
+
+#[tauri::command]
+pub fn enable_restricted_discovery(state: State<'_, AppState>) -> UiResult<anon_ipc::PrivacyView> {
+    state
+        .backend()?
+        .enable_restricted_discovery()
+        .map_err(UiError::from)
+}
+
+#[tauri::command]
+pub fn export_invite(state: State<'_, AppState>) -> UiResult<String> {
+    state.backend()?.export_invite().map_err(UiError::from)
+}
+
+#[tauri::command]
+pub fn set_traffic_shaping(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> UiResult<anon_ipc::PrivacyView> {
+    state
+        .backend()?
+        .set_traffic_shaping(enabled)
+        .map_err(UiError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +644,7 @@ pub fn create_vault(
         crate::build_transport(state.data_dir()),
         Arc::new(store),
     );
+    backend.initialize_privacy(true).map_err(UiError::from)?;
     state.install(backend);
     drop(guard);
 
@@ -618,6 +674,7 @@ pub fn unlock_vault(state: State<'_, AppState>, passphrase: String) -> UiResult<
         crate::build_transport(state.data_dir()),
         Arc::new(store),
     );
+    backend.initialize_privacy(false).map_err(UiError::from)?;
     state.install(backend);
     drop(guard);
 
@@ -651,6 +708,7 @@ pub fn migrate_vault(
         crate::build_transport(state.data_dir()),
         Arc::new(store),
     );
+    backend.initialize_privacy(false).map_err(UiError::from)?;
     state.install(backend);
     drop(guard);
 
@@ -698,6 +756,9 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
     builder.invoke_handler(tauri::generate_handler![
         // The launch screen. These are the only commands callable while locked.
         vault_view,
+        list_personas,
+        create_persona,
+        open_persona,
         assess_strength,
         create_vault,
         unlock_vault,
@@ -708,6 +769,10 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         note_escrow_exported,
         export_escrow,
         transport_view,
+        privacy_view,
+        enable_restricted_discovery,
+        export_invite,
+        set_traffic_shaping,
         conversations,
         messages,
         peers,

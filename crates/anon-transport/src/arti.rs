@@ -39,7 +39,7 @@ use crate::{AnonymityClass, AnonymityTransport, TransportStatus};
 use arti_client::config::pt::TransportConfigBuilder;
 use arti_client::config::{BridgeConfigBuilder, CfgPath};
 use arti_client::{TorClient, TorClientConfig};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use tor_hsservice::OnionServiceConfig;
 use tor_persist::hsnickname::HsNickname;
@@ -51,6 +51,35 @@ use tor_rtcompat::PreferredRuntime;
 /// and a stable nickname is what lets Arti find the *same* identity key on the
 /// next launch — which is what makes the address stable (D7).
 pub const ONION_SERVICE_NICKNAME: &str = "anon";
+
+fn onion_service_config(authorized_keys: Option<&[String]>) -> Result<OnionServiceConfig> {
+    let nickname = HsNickname::new(ONION_SERVICE_NICKNAME.to_string())
+        .map_err(|error| TransportError::Failed(error.to_string()))?;
+    let mut builder = OnionServiceConfig::builder();
+    builder.nickname(nickname);
+    if let Some(keys) = authorized_keys {
+        if keys.is_empty() || keys.len() > 160 {
+            return Err(TransportError::Failed(
+                "restricted discovery requires between 1 and 160 client keys".into(),
+            ));
+        }
+        let discovery = builder.restricted_discovery();
+        discovery.enabled(true);
+        for (index, key) in keys.iter().enumerate() {
+            discovery.static_keys().access().push((
+                format!("client-{index}").parse().map_err(|_| {
+                    TransportError::Failed("invalid discovery client nickname".into())
+                })?,
+                key.parse().map_err(|_| {
+                    TransportError::Failed("invalid discovery client public key".into())
+                })?,
+            ));
+        }
+    }
+    builder
+        .build()
+        .map_err(|error| TransportError::Failed(format!("onion service config rejected: {error}")))
+}
 
 /// The default bootstrap deadline, in seconds.
 ///
@@ -85,6 +114,61 @@ pub fn bootstrap_timeout() -> std::time::Duration {
 /// Matches the largest padded frame size (header + 512 KiB bucket) plus a small
 /// envelope margin so a peer cannot force an unbounded allocation.
 pub const MAX_INBOUND_PAYLOAD_BYTES: usize = 524_352;
+
+const MAX_CONCURRENT_INBOUND_STREAMS: usize = 16;
+const INBOUND_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const OUTBOUND_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+async fn write_outbound_payload<Stream>(stream: &mut Stream, payload: &[u8]) -> std::io::Result<()>
+where
+    Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream
+        .write_all(&(payload.len() as u32).to_le_bytes())
+        .await?;
+    stream.write_all(payload).await?;
+    stream.flush().await?;
+    let mut ack = [0u8; 1];
+    tokio::time::timeout(INBOUND_STREAM_TIMEOUT, stream.read_exact(&mut ack)).await??;
+    if ack != [1] {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid onion transport receipt",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+async fn read_inbound_payload<Stream>(stream: &mut Stream) -> std::io::Result<Vec<u8>>
+where
+    Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut len_bytes = [0u8; 4];
+    stream.read_exact(&mut len_bytes).await?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    read_inbound_body(stream, len).await
+}
+
+async fn read_inbound_body<Stream>(stream: &mut Stream, len: usize) -> std::io::Result<Vec<u8>>
+where
+    Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if len == 0 || len > MAX_INBOUND_PAYLOAD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "inbound payload length out of bounds",
+        ));
+    }
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await?;
+    let _ = stream.write_all(&[1u8]).await;
+    let _ = stream.flush().await;
+    Ok(payload)
+}
 
 /// Callback invoked for each complete inbound payload received on the onion service.
 type InboundHandler = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
@@ -183,6 +267,11 @@ pub struct ArtiTransport {
     /// bootstrapping. See [`crate::tor_config`] for why a bridge failure is fatal
     /// rather than a fallback.
     config: Mutex<TorConfig>,
+    authorized_keys: Mutex<Option<Vec<String>>>,
+    discovery_key: Mutex<Option<crate::DiscoveryKey>>,
+    shaping_enabled: Arc<AtomicBool>,
+    shaping_peers: Mutex<Vec<OnionId>>,
+    shaped_connections: Mutex<std::collections::HashMap<String, crate::shaping::Connection>>,
 }
 
 impl ArtiTransport {
@@ -195,6 +284,11 @@ impl ArtiTransport {
             local_onion: Mutex::new(None),
             inbound_handler: Arc::new(Mutex::new(None)),
             config: Mutex::new(TorConfig::none()),
+            authorized_keys: Mutex::new(None),
+            discovery_key: Mutex::new(None),
+            shaping_enabled: Arc::new(AtomicBool::new(false)),
+            shaping_peers: Mutex::new(Vec::new()),
+            shaped_connections: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -406,12 +500,8 @@ impl ArtiTransport {
         };
 
         let _runtime_guard = runtime.enter();
-        let nickname = HsNickname::new(ONION_SERVICE_NICKNAME.to_string())
-            .map_err(|e| TransportError::Failed(format!("invalid onion nickname: {e}")))?;
-        let config = OnionServiceConfig::builder()
-            .nickname(nickname)
-            .build()
-            .map_err(|e| TransportError::Failed(format!("onion service config rejected: {e}")))?;
+        let authorized_keys = self.authorized_keys.lock().unwrap();
+        let config = onion_service_config(authorized_keys.as_deref())?;
 
         let launched = match client.launch_onion_service(config) {
             Ok(v) => v,
@@ -448,42 +538,72 @@ impl ArtiTransport {
         let streams = tor_hsservice::handle_rend_requests(requests);
         let inbound_handler = Arc::clone(&self.inbound_handler);
         let worker_runtime = Arc::clone(&runtime);
+        let inbound_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INBOUND_STREAMS));
+        let shaping_enabled = self.shaping_enabled.clone();
+        let shaped_slots = Arc::new(tokio::sync::Semaphore::new(crate::shaping::MAX_PEERS));
         runtime.spawn(async move {
             use futures::StreamExt;
             let mut streams = Box::pin(streams);
             while let Some(stream_req) = streams.next().await {
+                let Ok(permit) = Arc::clone(&inbound_slots).try_acquire_owned() else {
+                    continue;
+                };
                 let handler = inbound_handler.lock().unwrap().clone();
+                let shaping_enabled = shaping_enabled.clone();
+                let shaped_slots = shaped_slots.clone();
                 worker_runtime.spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let Ok(mut stream) = stream_req
-                        .accept(tor_cell::relaycell::msg::Connected::new_empty())
-                        .await
-                    else {
+                    let deadline = tokio::time::Instant::now() + INBOUND_STREAM_TIMEOUT;
+                    let read_res = tokio::time::timeout_at(deadline, async {
+                        use tokio::io::AsyncReadExt;
+                        let mut stream = stream_req
+                            .accept(tor_cell::relaycell::msg::Connected::new_empty())
+                            .await
+                            .map_err(std::io::Error::other)?;
+                        let length = stream.read_u32_le().await?;
+                        Ok::<_, std::io::Error>((stream, length))
+                    })
+                    .await;
+                    let Ok(Ok((mut stream, length))) = read_res else {
                         return;
                     };
-                    let read_res =
-                        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                            let mut len_bytes = [0u8; 4];
-                            stream.read_exact(&mut len_bytes).await?;
-                            let len = u32::from_le_bytes(len_bytes) as usize;
-                            if len == 0 || len > MAX_INBOUND_PAYLOAD_BYTES {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "inbound payload length out of bounds",
-                                ));
-                            }
-                            let mut buf = vec![0u8; len];
-                            stream.read_exact(&mut buf).await?;
-                            // Send a 1-byte application-layer receipt so the sender knows the full
-                            // frame arrived at the recipient onion service before closing the stream.
-                            let _ = stream.write_all(&[1u8]).await;
-                            let _ = stream.flush().await;
-                            Ok::<Vec<u8>, std::io::Error>(buf)
-                        })
-                        .await;
-                    if let Ok(Ok(buf)) = read_res {
+                    if length == crate::shaping::MAGIC {
+                        if !shaping_enabled.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let Ok(shaped_permit) = shaped_slots.try_acquire_owned() else {
+                            return;
+                        };
+                        if let Some(callback) = handler {
+                            let permits = Arc::new((permit, shaped_permit));
+                            let handler = Arc::new(move |payload| {
+                                let _permits = permits.clone();
+                                callback(payload);
+                            });
+                            let _ = crate::shaping::receive(
+                                stream,
+                                shaping_enabled,
+                                handler,
+                                crate::shaping::PERIOD,
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                    if shaping_enabled.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Ok(Ok(buf)) = tokio::time::timeout_at(
+                        deadline,
+                        read_inbound_body(&mut stream, length as usize),
+                    )
+                    .await
+                    {
                         if let Some(cb) = handler {
-                            cb(buf);
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let _permit = permit;
+                                cb(buf);
+                            })
+                            .await;
                         }
                     }
                 });
@@ -494,7 +614,88 @@ impl ArtiTransport {
             address: address.clone(),
             running,
         });
+        drop(authorized_keys);
+        self.start_shaped_connections()?;
         Ok(address)
+    }
+
+    fn install_discovery_key(
+        &self,
+        client: &TorClient<PreferredRuntime>,
+        host: &str,
+    ) -> Result<()> {
+        if let Some(key) = self.discovery_key.lock().unwrap().as_ref() {
+            let hsid: tor_hscrypto::pk::HsId = host
+                .parse()
+                .map_err(|_| TransportError::Failed("invalid onion service identity".into()))?;
+            match client
+                .get_service_discovery_key(hsid)
+                .map_err(|error| TransportError::Failed(error.to_string()))?
+            {
+                Some(existing) if existing.to_string() != key.public_key() => {
+                    return Err(TransportError::Failed(
+                        "onion client authorization key conflict".into(),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    let secret = tor_llcrypto::pk::curve25519::StaticSecret::from(*key.secret());
+                    client
+                        .insert_service_discovery_key(
+                            arti_client::KeystoreSelector::Primary,
+                            hsid,
+                            secret.into(),
+                        )
+                        .map_err(|error| TransportError::Failed(error.to_string()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn start_shaped_connections(&self) -> Result<()> {
+        let mut connections = self.shaped_connections.lock().unwrap();
+        if !self.shaping_enabled.load(Ordering::SeqCst) {
+            connections.clear();
+            return Ok(());
+        }
+        let peers = self.shaping_peers.lock().unwrap().clone();
+        connections.retain(|host, _| peers.iter().any(|peer| peer.as_str() == host));
+        let guard = self.client.lock().unwrap();
+        let Some(active) = guard.as_ref() else {
+            return Ok(());
+        };
+        for peer in peers {
+            if connections.contains_key(peer.as_str()) {
+                continue;
+            }
+            self.install_discovery_key(&active.client, peer.as_str())?;
+            let client = active.client.clone();
+            let host = peer.as_str().to_string();
+            let (queue, mut jobs) = tokio::sync::mpsc::channel(1);
+            let task = active.runtime.spawn(async move {
+                loop {
+                    if let Ok(Ok(stream)) = tokio::time::timeout(
+                        OUTBOUND_STREAM_TIMEOUT,
+                        client.connect((host.as_str(), 80)),
+                    )
+                    .await
+                    {
+                        let _ =
+                            crate::shaping::send(stream, &mut jobs, crate::shaping::PERIOD).await;
+                    }
+                    if jobs.is_closed() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+            });
+            connections.insert(
+                peer.as_str().into(),
+                crate::shaping::Connection { queue, task },
+            );
+        }
+        Ok(())
     }
 
     /// Whether an onion service is actually being hosted.
@@ -588,6 +789,53 @@ impl Default for ArtiTransport {
 }
 
 impl AnonymityTransport for ArtiTransport {
+    fn configure_shaping(&self, peers: &[OnionId], enabled: bool) -> Result<()> {
+        if enabled
+            && (self.authorized_keys.lock().unwrap().is_none()
+                || peers.len() > crate::shaping::MAX_PEERS)
+        {
+            return Err(TransportError::Failed(
+                "traffic shaping requires restricted discovery and at most four peers".into(),
+            ));
+        }
+        *self.shaping_peers.lock().unwrap() = peers.to_vec();
+        self.shaping_enabled.store(enabled, Ordering::SeqCst);
+        self.start_shaped_connections()
+    }
+
+    fn start(&self) -> Result<()> {
+        self.bootstrap()?;
+        match self.host_onion_service() {
+            Ok(_) => Ok(()),
+            Err(error) => self.fail(error.to_string()),
+        }
+    }
+
+    fn configure_discovery(
+        &self,
+        key: &crate::DiscoveryKey,
+        authorized: Option<&[String]>,
+    ) -> Result<()> {
+        let config = onion_service_config(authorized)?;
+        let mut current = self.authorized_keys.lock().unwrap();
+        if current.is_some() && authorized.is_none() {
+            return Err(TransportError::Failed(
+                "restricted discovery cannot be downgraded while running".into(),
+            ));
+        }
+        if let Some(hosted) = self.local_onion.lock().unwrap().as_ref() {
+            hosted
+                .running
+                .reconfigure(config, tor_config::Reconfigure::AllOrNothing)
+                .map_err(|error| {
+                    TransportError::Failed(format!("discovery update failed: {error}"))
+                })?;
+        }
+        *self.discovery_key.lock().unwrap() = Some(key.clone());
+        *current = authorized.map(<[String]>::to_vec);
+        Ok(())
+    }
+
     fn anonymity(&self) -> AnonymityClass {
         // Arti is a Tor client, so this is Tor-grade by construction. Note that
         // `send` still refuses unless the state is `Ready`.
@@ -644,6 +892,8 @@ impl AnonymityTransport for ArtiTransport {
             .ok_or_else(|| TransportError::InvalidRoute("not an onion route".to_string()))?
             .to_string();
 
+        self.install_discovery_key(&client, &host)?;
+
         // Connect, write the length-prefixed payload, and await the 1-byte receipt
         // before dropping the stream (dropping a Tor DataStream before the peer reads
         // sends an END cell that can truncate in-flight data).
@@ -652,23 +902,39 @@ impl AnonymityTransport for ArtiTransport {
                 "outbound payload length out of bounds".to_string(),
             ));
         }
-        let len_prefix = (payload.len() as u32).to_le_bytes();
-
+        if self.shaping_enabled.load(Ordering::SeqCst) {
+            let queue = self
+                .shaped_connections
+                .lock()
+                .unwrap()
+                .get(&host)
+                .map(|connection| connection.queue.clone())
+                .ok_or_else(|| {
+                    TransportError::Failed("peer has no configured shaped connection".into())
+                })?;
+            let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+            queue
+                .try_send(crate::shaping::Job {
+                    payload: payload.to_vec(),
+                    deadline: std::time::Instant::now() + crate::shaping::SEND_TIMEOUT,
+                    reply,
+                })
+                .map_err(|_| {
+                    TransportError::Failed("shaped send queue is busy; retry later".into())
+                })?;
+            return receipt.recv_timeout(crate::shaping::SEND_TIMEOUT)
+                .map_err(|_| TransportError::Failed("shaped delivery was not acknowledged; both peers must enable traffic shaping".into()));
+        }
         let result = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     runtime.block_on(async {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let mut stream = client.connect((host.as_str(), 80)).await?;
-                        stream.write_all(&len_prefix).await?;
-                        stream.write_all(payload).await?;
-                        stream.flush().await?;
-                        let mut ack = [0u8; 1];
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            stream.read_exact(&mut ack),
-                        )
-                        .await;
+                        tokio::time::timeout(OUTBOUND_STREAM_TIMEOUT, async {
+                            let mut stream = client.connect((host.as_str(), 80)).await?;
+                            write_outbound_payload(&mut stream, payload).await?;
+                            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                        })
+                        .await??;
                         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
                     })
                 })
@@ -680,6 +946,8 @@ impl AnonymityTransport for ArtiTransport {
     }
 
     fn shutdown(&self) {
+        self.shaping_enabled.store(false, Ordering::SeqCst);
+        self.shaped_connections.lock().unwrap().clear();
         *self.local_onion.lock().unwrap() = None;
         let mut client = self.client.lock().unwrap();
         match State::from_u8(self.state.load(Ordering::SeqCst)) {
@@ -707,6 +975,119 @@ impl std::fmt::Debug for ArtiTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restricted_discovery_configuration_is_validated_and_distinct() {
+        let public = onion_service_config(None).unwrap();
+        let keys = vec![
+            "descriptor:x25519:zprrmiv6dv6sjfl7sfbsvlj5vunpgcdfevz7m23ltlvtccxjqbka".to_string(),
+        ];
+        let restricted = onion_service_config(Some(&keys)).unwrap();
+        assert_ne!(public, restricted);
+        assert!(onion_service_config(Some(&[])).is_err());
+        assert!(onion_service_config(Some(&["invalid".into()])).is_err());
+        assert!(onion_service_config(Some(&vec![keys[0].clone(); 161])).is_err());
+    }
+
+    #[test]
+    fn outbound_stream_requires_a_valid_receipt() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for receipt in [Some(1u8), Some(0), Some(255), None] {
+                let (mut sender, mut receiver) = tokio::io::duplex(32);
+                let receive = async move {
+                    let mut wire = [0u8; 9];
+                    receiver.read_exact(&mut wire).await.unwrap();
+                    assert_eq!(&wire[..4], &5u32.to_le_bytes());
+                    assert_eq!(&wire[4..], b"hello");
+                    if let Some(receipt) = receipt {
+                        receiver.write_all(&[receipt]).await.unwrap();
+                    }
+                };
+                let (result, ()) =
+                    futures::join!(write_outbound_payload(&mut sender, b"hello"), receive);
+                assert_eq!(result.is_ok(), receipt == Some(1));
+            }
+        });
+    }
+
+    #[test]
+    fn outbound_stream_stall_is_not_success() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (mut sender, _receiver) = tokio::io::duplex(32);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                write_outbound_payload(&mut sender, b"hello"),
+            )
+            .await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn inbound_streams_reject_invalid_lengths_and_truncated_payloads() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use tokio::io::AsyncWriteExt;
+            for length in [0, MAX_INBOUND_PAYLOAD_BYTES as u32 + 1, u32::MAX] {
+                let (mut sender, mut receiver) = tokio::io::duplex(16);
+                sender.write_all(&length.to_le_bytes()).await.unwrap();
+                let error = read_inbound_payload(&mut receiver).await.unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            }
+            let (mut sender, mut receiver) = tokio::io::duplex(16);
+            sender.write_all(&10u32.to_le_bytes()).await.unwrap();
+            sender.write_all(b"short").await.unwrap();
+            drop(sender);
+            let error = read_inbound_payload(&mut receiver).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        });
+    }
+
+    #[test]
+    fn inbound_streams_accept_maximum_payload_and_acknowledge_receipt() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut sender, mut receiver) = tokio::io::duplex(1024);
+            let send = async {
+                sender
+                    .write_all(&(MAX_INBOUND_PAYLOAD_BYTES as u32).to_le_bytes())
+                    .await
+                    .unwrap();
+                sender
+                    .write_all(&vec![42; MAX_INBOUND_PAYLOAD_BYTES])
+                    .await
+                    .unwrap();
+                assert_eq!(sender.read_u8().await.unwrap(), 1);
+            };
+            let receive = async {
+                let payload = read_inbound_payload(&mut receiver).await.unwrap();
+                assert_eq!(payload, vec![42; MAX_INBOUND_PAYLOAD_BYTES]);
+            };
+            futures::join!(send, receive);
+        });
+    }
+
+    #[test]
+    fn inbound_stream_budget_recovers_after_timeout() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INBOUND_STREAMS));
+            let mut permits: Vec<_> = (0..MAX_CONCURRENT_INBOUND_STREAMS)
+                .map(|_| Arc::clone(&slots).try_acquire_owned().unwrap())
+                .collect();
+            assert!(Arc::clone(&slots).try_acquire_owned().is_err());
+            let permit = permits.pop().unwrap();
+            let (_sender, mut receiver) = tokio::io::duplex(16);
+            let result = tokio::time::timeout(std::time::Duration::from_millis(10), async move {
+                let _permit = permit;
+                read_inbound_payload(&mut receiver).await
+            })
+            .await;
+            assert!(result.is_err());
+            assert!(Arc::clone(&slots).try_acquire_owned().is_ok());
+            drop(permits);
+            assert_eq!(slots.available_permits(), MAX_CONCURRENT_INBOUND_STREAMS);
+        });
+    }
 
     #[test]
     fn a_fresh_transport_is_idle_and_refuses_to_send() {

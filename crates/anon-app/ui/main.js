@@ -24,8 +24,7 @@
 //   add_member(group_id, kp)   -> AddMemberOutcome
 //   remove_member(gid, leaf)   -> RemoveMemberOutcome
 //
-// The launch screen (Gap 2) adds five commands, and they are the only ones callable
-// before the vault is open:
+// The launch screen (Gap 2) exposes the following vault commands:
 //
 //   vault_view()                       -> VaultView
 //   assess_strength(candidate)         -> StrengthView
@@ -33,7 +32,8 @@
 //   unlock_vault(passphrase)           -> VaultView
 //   migrate_vault(passphrase, confirm) -> VaultView
 //
-// Every other command returns a `locked` error until one of those succeeds. That is the
+// Persona listing, creation, and opening are also available while locked.
+// Messaging and identity commands return a `locked` error until unlock succeeds. That is the
 // enforcement: the app cannot read a message or send one without the passphrase, because
 // there is no backend to call.
 
@@ -342,12 +342,15 @@ let sidebarSearchQuery = "";
 let stagedAttachment = null; // { name, mime, size, dataUrl }
 let stagedGroupAttachment = null; // { name, mime, size, dataUrl }
 
-function updateInviteBundleDisplay() {
+async function updateInviteBundleDisplay() {
   const el = $("invite-bundle");
   if (!el) return;
   if (selfContactCode && selfOnionAddress && selfOnionAddress.endsWith(".onion")) {
-    const nameParam = selfDisplayName ? `#${encodeURIComponent(selfDisplayName)}` : "";
-    el.textContent = `${selfContactCode}@${selfOnionAddress}${nameParam}`;
+    try {
+      el.textContent = await invoke("export_invite");
+    } catch {
+      el.textContent = "Invite unavailable";
+    }
   } else if (selfContactCode) {
     el.textContent = `${selfContactCode} (waiting for .onion…)`;
   } else {
@@ -356,6 +359,10 @@ function updateInviteBundleDisplay() {
 }
 
 function openModal(modalId) {
+  if (modalId === "modal-identity") {
+    refreshPrivacy();
+    refreshPersonas();
+  }
   const backdrop = $("modal-backdrop");
   if (!backdrop) return;
   backdrop.hidden = false;
@@ -501,21 +508,13 @@ async function copyLocalOnion() {
 }
 
 async function copyInviteBundle() {
-  updateInviteBundleDisplay();
-  const bundle = $("invite-bundle") ? $("invite-bundle").textContent : "";
-  if (!selfContactCode) {
-    $("status-line").textContent = "identity not loaded yet";
-    return;
+  try {
+    const bundle = await invoke("export_invite");
+    $("invite-bundle").textContent = bundle;
+    await copyTextWithFallback(bundle, "invite-bundle", "signed invite copied");
+  } catch (error) {
+    showError($("status-line"), error);
   }
-  const textToCopy =
-    selfOnionAddress && selfOnionAddress.endsWith(".onion")
-      ? bundle
-      : selfContactCode;
-  await copyTextWithFallback(
-    textToCopy,
-    "invite-bundle",
-    selfOnionAddress ? "full Tor invite bundle copied!" : "contact code copied (Tor still starting)"
-  );
 }
 
 async function exportEscrow() {
@@ -578,6 +577,7 @@ function splitLabelAndOnion(stored) {
 /** Parse a pasted invite string like `anon1...@xyz.onion#Alice` into { code, onion, label }. */
 function parseInviteInput(raw) {
   let text = (raw || "").trim();
+  if (text.startsWith("tornel1:")) return { code: text, onion: null, label: null, signed: true };
   let label = null;
   const hashIdx = text.indexOf("#");
   if (hashIdx !== -1) {
@@ -708,23 +708,24 @@ async function addPeer() {
   try {
     const out = await invoke("add_peer", {
       contact_code: contactCode,
-      label: combinedLabel,
+      label: parsedInvite.signed ? (labelRaw || null) : combinedLabel,
     });
     result.textContent = `friend saved · opening chat…`;
     result.classList.add("ok");
     $("peer-contact-code").value = "";
     $("peer-label").value = "";
     if ($("peer-onion")) $("peer-onion").value = "";
-    if (onionRaw) {
-      $("recipient-onion").value = onionRaw;
+    const savedOnion = splitLabelAndOnion(out.peer.onion_short).onion || onionRaw;
+    if (savedOnion) {
+      $("recipient-onion").value = savedOnion;
     }
     closeModals();
     await refreshPeers();
     await refreshConversations();
     await selectConversation(
       out.conversation_id,
-      labelRaw ? `${labelRaw} (${contactCode.slice(0, 12)}…)` : `${contactCode.slice(0, 12)}…`,
-      onionRaw
+      labelRaw ? `${labelRaw} (${out.peer.contact_code.slice(0, 12)}…)` : `${out.peer.contact_code.slice(0, 12)}…`,
+      savedOnion
     );
   } catch (err) {
     showError(result, err);
@@ -1837,12 +1838,15 @@ async function refreshAll() {
     refreshConversations(),
     refreshGroups(),
     refreshConsent(),
+    refreshPrivacy(),
   ]);
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
   wireSidebarFilters();
   wireModals();
+  wirePrivacyControls();
+  await refreshPersonas();
 
   $("copy-code")?.addEventListener("click", copyContactCode);
   $("copy-onion")?.addEventListener("click", copyLocalOnion);
@@ -1961,4 +1965,90 @@ function startRefreshLoops() {
     }
   }, 3000);
   setInterval(refreshConsent, 3000);
+}
+
+async function refreshPrivacy() {
+  try {
+    const view = await invoke("privacy_view");
+    $("restricted-discovery").checked = view.restricted_discovery;
+    $("restricted-discovery").disabled = view.restricted_discovery || view.legacy_contacts > 0;
+    $("discovery-state").textContent = view.restricted_discovery
+      ? "Restricted discovery enabled"
+      : view.legacy_contacts > 0
+        ? `${view.legacy_contacts} contacts need upgraded signed invitations`
+        : "Legacy public discovery";
+    $("traffic-shaping").checked = view.traffic_shaping;
+    $("traffic-shaping").disabled = !view.restricted_discovery;
+  } catch (error) {
+    showError($("privacy-result"), error);
+  }
+}
+
+async function refreshPersonas() {
+  try {
+    const personas = await invoke("list_personas");
+    for (const prefix of ["launch", "identity"]) {
+      const select = $(`${prefix}-personas`);
+      const previous = select.value;
+      select.replaceChildren();
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = personas.length ? "Select persona" : "No additional personas";
+      select.appendChild(placeholder);
+      for (const persona of personas) {
+        const option = document.createElement("option");
+        option.value = persona.id;
+        option.textContent = persona.name;
+        select.appendChild(option);
+      }
+      if (personas.some((persona) => persona.id === previous)) select.value = previous;
+      $(`${prefix}-open-persona`).disabled = !select.value;
+    }
+  } catch (error) {
+    showError($("launch-persona-result"), error);
+  }
+}
+
+function wirePrivacyControls() {
+  for (const [id, command] of [["restricted-discovery", "enable_restricted_discovery"], ["traffic-shaping", "set_traffic_shaping"]]) {
+    $(id).addEventListener("change", async (event) => {
+      const enabled = event.target.checked;
+      event.target.disabled = true;
+      clearError($("privacy-result"));
+      try {
+        await invoke(command, command === "set_traffic_shaping" ? { enabled } : {});
+      } catch (error) {
+        showError($("privacy-result"), error);
+      } finally {
+        await refreshPrivacy();
+      }
+    });
+  }
+  for (const prefix of ["launch", "identity"]) {
+    const select = $(`${prefix}-personas`);
+    select.addEventListener("change", () => { $(`${prefix}-open-persona`).disabled = !select.value; });
+    for (const action of ["create", "open"]) {
+      const button = $(`${prefix}-${action}-persona`);
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        const result = $(`${prefix}-persona-result`);
+        clearError(result);
+        try {
+          let id = select.value;
+          if (action === "create") {
+            const persona = await invoke("create_persona", { name: $(`${prefix}-persona-name`).value });
+            id = persona.id;
+            $(`${prefix}-persona-name`).value = "";
+          }
+          await invoke("open_persona", { id });
+          result.textContent = "Persona opened in a separate window";
+          await refreshPersonas();
+        } catch (error) {
+          showError(result, error);
+        } finally {
+          button.disabled = action === "open" && !select.value;
+        }
+      });
+    }
+  }
 }

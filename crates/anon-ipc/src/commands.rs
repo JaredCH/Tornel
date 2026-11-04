@@ -203,8 +203,12 @@ fn decode_and_verify_direct_envelope(
     Ok((sent_at, body.to_vec()))
 }
 
+#[path = "privacy.rs"]
+mod privacy;
+
 /// The backend.
 pub struct Backend {
+    privacy_lock: Mutex<()>,
     identity: Arc<IdentityKeys>,
     store: Arc<Store>,
     messaging: Arc<MessagingService>,
@@ -246,6 +250,7 @@ impl Backend {
 
         Self {
             identity,
+            privacy_lock: Mutex::new(()),
             store,
             messaging,
             consent,
@@ -1194,7 +1199,7 @@ impl Backend {
     ///
     /// Returns the deterministic 32-hex-character direct conversation id shared
     /// with this peer, plus the peer view.
-    pub fn add_peer(
+    fn save_peer(
         &self,
         contact_code: &str,
         label: Option<String>,
@@ -1712,10 +1717,131 @@ pub fn seal_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn signed_invites_enable_restricted_contacts_and_reject_tampering() {
+        let onion = anon_transport::OnionId::parse(
+            "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion",
+        )
+        .unwrap();
+        let alice = Backend::new(
+            IdentityKeys::from_seed(&[81; 32]),
+            Arc::new(anon_transport::MockTransport::tor_like(onion.clone())),
+            test_store("privacy-alice"),
+        );
+        let bob = Backend::new(
+            IdentityKeys::from_seed(&[82; 32]),
+            Arc::new(anon_transport::MockTransport::tor_like(onion)),
+            test_store("privacy-bob"),
+        );
+        alice.initialize_privacy(true).unwrap();
+        bob.initialize_privacy(true).unwrap();
+        let invite = alice.export_invite().unwrap();
+        assert!(bob.add_peer(&alice.contact_code().unwrap(), None).is_err());
+        assert!(bob.add_peer(&invite.replace("vww6", "aww6"), None).is_err());
+        assert!(bob.store.contacts().unwrap().is_empty());
+        bob.add_peer(&invite, Some("Alice".into())).unwrap();
+        assert_eq!(bob.privacy_view().unwrap().legacy_contacts, 0);
+        assert!(bob.privacy_view().unwrap().restricted_discovery);
+        assert!(!invite.contains("secret"));
+        bob.initialize_privacy(false).unwrap();
+        assert!(bob.privacy_view().unwrap().restricted_discovery);
+        assert!(!bob.privacy_view().unwrap().traffic_shaping);
+        assert!(bob.set_traffic_shaping(true).unwrap().traffic_shaping);
+        assert!(!bob.set_traffic_shaping(false).unwrap().traffic_shaping);
+    }
+
     use super::*;
     use anon_storage::{Argon2Params, Store, StoreConfig};
     use anon_transport::MockTransport;
     use base64::{engine::general_purpose::STANDARD, Engine};
+
+    #[test]
+    fn privacy_migration_requires_upgraded_contacts_and_survives_reopening() {
+        let onion = anon_transport::OnionId::parse(
+            "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion",
+        )
+        .unwrap();
+        let legacy = Backend::new(
+            IdentityKeys::from_seed(&[83; 32]),
+            Arc::new(MockTransport::tor_like(onion.clone())),
+            test_store("privacy-legacy"),
+        );
+        let peer = Backend::new(
+            IdentityKeys::from_seed(&[84; 32]),
+            Arc::new(MockTransport::tor_like(onion.clone())),
+            test_store("privacy-upgraded"),
+        );
+        legacy.initialize_privacy(false).unwrap();
+        assert!(!legacy.privacy_view().unwrap().restricted_discovery);
+        assert!(!legacy.privacy_view().unwrap().traffic_shaping);
+        legacy
+            .add_peer(&peer.contact_code().unwrap(), None)
+            .unwrap();
+        assert_eq!(legacy.privacy_view().unwrap().legacy_contacts, 1);
+        assert!(legacy.enable_restricted_discovery().is_err());
+        assert!(legacy.set_traffic_shaping(true).is_err());
+        legacy
+            .add_peer(&peer.export_invite().unwrap(), None)
+            .unwrap();
+        legacy.enable_restricted_discovery().unwrap();
+        legacy.set_traffic_shaping(true).unwrap();
+        let path = legacy.store.path().to_owned();
+        drop(legacy);
+        let store = Store::open(
+            &path,
+            "test-passphrase-1234",
+            StoreConfig {
+                params: Argon2Params::test_fast(),
+                purge_on_open: false,
+                vacuum_after_purge: false,
+            },
+        )
+        .unwrap();
+        let reopened = Backend::new(
+            IdentityKeys::from_seed(&[83; 32]),
+            Arc::new(MockTransport::tor_like(onion)),
+            Arc::new(store),
+        );
+        reopened.initialize_privacy(false).unwrap();
+        let view = reopened.privacy_view().unwrap();
+        assert!(view.restricted_discovery && view.traffic_shaping);
+        assert_eq!(view.legacy_contacts, 0);
+        assert_eq!(reopened.store.contacts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn privacy_shaping_caps_contacts_without_silently_changing_policy() {
+        let onion = anon_transport::OnionId::parse(
+            "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion",
+        )
+        .unwrap();
+        let backend = Backend::new(
+            IdentityKeys::from_seed(&[85; 32]),
+            Arc::new(MockTransport::tor_like(onion.clone())),
+            test_store("privacy-cap"),
+        );
+        backend.initialize_privacy(true).unwrap();
+        backend.set_traffic_shaping(true).unwrap();
+        for index in 0..5u8 {
+            let peer = Backend::new(
+                IdentityKeys::from_seed(&[90 + index; 32]),
+                Arc::new(MockTransport::tor_like(onion.clone())),
+                test_store(&format!("privacy-cap-{index}")),
+            );
+            let invite = peer.export_invite().unwrap();
+            if index < 4 {
+                backend.add_peer(&invite, None).unwrap();
+            } else {
+                assert!(backend.add_peer(&invite, None).is_err());
+                assert_eq!(backend.store.contacts().unwrap().len(), 4);
+                assert!(backend.privacy_view().unwrap().traffic_shaping);
+                backend.set_traffic_shaping(false).unwrap();
+                backend.add_peer(&invite, None).unwrap();
+                assert!(backend.set_traffic_shaping(true).is_err());
+                assert!(!backend.privacy_view().unwrap().traffic_shaping);
+            }
+        }
+    }
 
     fn image_attachment() -> String {
         let image = image::RgbImage::from_pixel(64, 48, image::Rgb([40, 100, 180]));
