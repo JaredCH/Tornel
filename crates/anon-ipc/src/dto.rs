@@ -142,6 +142,23 @@ pub struct TransportView {
     pub local_onion_short: Option<String>,
     /// Full `.onion` address of our hosted service, so the user can copy and share it.
     pub local_onion: Option<String>,
+    /// Frames waiting in the outbound queue because the peer was unreachable.
+    ///
+    /// Shown so "queued" is a visible state rather than a silent one (`plan.md` §8).
+    pub queued_count: usize,
+}
+
+/// One frame waiting in the outbound send queue.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueuedMessageView {
+    /// Queue row id, hex. Not a message id — the frame's own id is inside it.
+    pub id: String,
+    /// When it was queued (epoch seconds).
+    pub created_at: i64,
+    /// Delivery attempts so far.
+    pub attempts: u32,
+    /// Why the last attempt failed, when it did.
+    pub last_error: Option<String>,
 }
 
 /// A rotation proposal rendered for the consent modal (`plan.md` §5.1).
@@ -395,6 +412,13 @@ pub struct StrengthView {
     pub meets_minimum_length: bool,
     /// Estimated entropy in bits. Order-of-magnitude, not a guarantee.
     pub entropy_bits: u32,
+    /// Whether the candidate is on the well-known-weak deny-list.
+    ///
+    /// Reported separately from `warnings` so the UI can colour its bar from the
+    /// same facts the vault rejects on, instead of inferring from prose.
+    pub is_well_known_weak: bool,
+    /// Whether the candidate looks like a repeated or sequential pattern.
+    pub is_repeated_pattern: bool,
     /// Human-readable warnings. Empty when nothing is wrong.
     pub warnings: Vec<String>,
     /// Whether the vault would accept this candidate.

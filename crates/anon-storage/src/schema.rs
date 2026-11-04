@@ -33,6 +33,7 @@ pub const RETENTION_BOUND_TABLES: &[&str] = &[
     "messages",
     "attachments",
     "mailbox_buffer",
+    "send_queue",
     "consent_log",
 ];
 
@@ -176,6 +177,35 @@ CREATE INDEX IF NOT EXISTS idx_mailbox_expires_at ON mailbox_buffer (expires_at)
 CREATE INDEX IF NOT EXISTS idx_mailbox_recipient
     ON mailbox_buffer (recipient, received_at);
 
+-- Outbound send queue. Holds frames that could not be handed to the transport
+-- because the peer (or our own Tor circuit) was not reachable yet, so they can be
+-- retried instead of being lost. Retention-bound for the same reason as the
+-- mailbox: a message that never lands must not outlive the ceiling either.
+--
+-- The stored `ciphertext` is the already-sealed frame, re-encrypted at rest under
+-- a bucket key. The queue therefore never holds plaintext, and a queue row that
+-- survives a shred is undecryptable.
+CREATE TABLE IF NOT EXISTS send_queue (
+    id              BLOB PRIMARY KEY,
+    conversation    BLOB NOT NULL,
+    route           TEXT NOT NULL,
+    epoch           INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL,
+    attempts        INTEGER NOT NULL,
+    last_attempt_at INTEGER,
+    last_error      TEXT,
+    bucket          TEXT NOT NULL,
+    nonce           BLOB NOT NULL,
+    ciphertext      BLOB NOT NULL,
+    CHECK (expires_at > created_at),
+    CHECK (attempts >= 0)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_send_queue_expires_at ON send_queue (expires_at);
+CREATE INDEX IF NOT EXISTS idx_send_queue_created
+    ON send_queue (created_at);
+
 -- Consent audit log (plan.md §5.2 "Auditability"). Retention-bound: the log
 -- itself must not outlive the retention ceiling.
 CREATE TABLE IF NOT EXISTS consent_log (
@@ -221,6 +251,10 @@ pub const PURGE_STATEMENTS: &[(&str, &str)] = &[
     (
         "mailbox_buffer",
         "DELETE FROM mailbox_buffer WHERE expires_at <= ?1",
+    ),
+    (
+        "send_queue",
+        "DELETE FROM send_queue WHERE expires_at <= ?1",
     ),
     (
         "conversations",

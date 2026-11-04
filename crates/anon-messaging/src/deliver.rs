@@ -128,6 +128,17 @@ impl Outbox {
         self.seen.lock().unwrap().contains(id)
     }
 
+    /// Forget an id that was observed but never actually sent.
+    ///
+    /// Needed by the send queue: a frame is observed before the transport is
+    /// asked to carry it, so a *failed* attempt would otherwise poison the id and
+    /// make every retry look like a replay. Only a failed attempt is forgotten —
+    /// a successful send stays observed, which is what keeps the replay guard
+    /// meaningful.
+    pub fn forget(&self, id: &MessageId) -> bool {
+        self.seen.lock().unwrap().remove(id)
+    }
+
     /// Number of tracked ids.
     pub fn tracked(&self) -> usize {
         self.seen.lock().unwrap().len()
@@ -170,7 +181,14 @@ pub fn send_frame(
 
     let payload = frame.encode();
     // Gate 2: the transport enforces Ready + TorOnion.
-    transport.send(route, &payload)?;
+    //
+    // A failure here means nothing left the machine, so the id must not stay in
+    // the seen-set: the send queue retries the same frame, and a retry that was
+    // rejected as a replay would turn a transient outage into permanent loss.
+    if let Err(e) = transport.send(route, &payload) {
+        outbox.forget(&frame.id());
+        return Err(e.into());
+    }
 
     Ok(DeliveryReport {
         id: frame.id(),

@@ -24,6 +24,7 @@ pub mod error;
 pub mod frame;
 pub mod group;
 pub mod mailbox_host;
+pub mod queue;
 pub mod service;
 
 pub use deliver::{DeliveryOutcome, DeliveryReport, Outbox};
@@ -31,6 +32,7 @@ pub use error::{FrameError, MessageError, Result};
 pub use frame::{Frame, MessageId};
 pub use group::GroupMessaging;
 pub use mailbox_host::{refusal_to_error, MailboxHost};
+pub use queue::{is_retryable, DrainReport, SendQueueService};
 pub use service::MessagingService;
 
 /// Protocol version carried in every frame (`plan.md` §11, "versioning").

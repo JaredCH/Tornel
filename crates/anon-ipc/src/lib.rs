@@ -36,7 +36,7 @@ pub use dto::PrivacyView;
 pub use dto::{
     AddMemberOutcome, ConsentPrompt, ConsentSubmission, ConversationView, DeliveryState,
     GroupMemberView, GroupView, IdentityView, MessageView, PeerView, ProposalView,
-    RemoveMemberOutcome, SendRequest, StrengthView, TransportView, VaultView,
+    QueuedMessageView, RemoveMemberOutcome, SendRequest, StrengthView, TransportView, VaultView,
 };
 pub use error::{CommandError, IpcError, Result};
 
@@ -112,6 +112,11 @@ pub fn dto_inventory() -> Vec<&'static str> {
         "blocked_reason",
         "local_onion_short",
         "local_onion",
+        "queued_count",
+        // QueuedMessageView
+        "created_at",
+        "attempts",
+        "last_error",
         // ProposalView
         "proposal_id",
         "group_id",
@@ -167,6 +172,8 @@ pub fn dto_inventory() -> Vec<&'static str> {
         // StrengthView
         "meets_minimum_length",
         "entropy_bits",
+        "is_well_known_weak",
+        "is_repeated_pattern",
         "warnings",
         "acceptable",
     ]

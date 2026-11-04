@@ -103,8 +103,13 @@ fn launch_command(root: &Path, id: &str) -> Result<std::process::Command, String
     command
         .env("ANON_DATA_DIR", &dir)
         .env("ANON_PERSONA_ROOT", root)
-        .env("ANON_WINDOW_TITLE", format!("anon - {}", persona.name))
-        .env("WEBVIEW2_USER_DATA_FOLDER", dir.join("webview2"));
+        .env("ANON_WINDOW_TITLE", format!("anon - {}", persona.name));
+    // WebView2 is Windows-only; on Linux the equivalent isolation is a separate
+    // WebKit data directory, which Tauri reads from this variable. Setting both is
+    // harmless — each platform ignores the other's.
+    command
+        .env("WEBVIEW2_USER_DATA_FOLDER", dir.join("webview2"))
+        .env("WEBKIT_USER_DATA_DIR", dir.join("webkit"));
     Ok(command)
 }
 

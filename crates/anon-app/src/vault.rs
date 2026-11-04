@@ -228,16 +228,11 @@ impl Vault {
     /// weak one. A long-but-obvious passphrase is not accepted here even though the
     /// escrow flow would warn and proceed.
     pub fn is_acceptable(&self, passphrase: &str) -> bool {
-        let a = assess_passphrase(passphrase);
-        if !a.meets_minimum_length {
-            return false;
-        }
-        // The deny-list and pattern checks are the ones that catch "passwordpassword"
-        // and "abcdefghijklm" — long strings with almost no entropy. Rejecting those is
-        // the difference between a policy and a suggestion.
-        !a.warnings
-            .iter()
-            .any(|w| w.contains("well-known weak") || w.contains("repeated or sequential"))
+        // Delegated to the assessment so the UI's live hint and this check cannot
+        // drift apart. They previously did: the hint coloured its bar from entropy
+        // alone while this rejected on warning *text*, so a passphrase could show a
+        // green bar and still be refused.
+        assess_passphrase(passphrase).is_acceptable_for_vault()
     }
 
     /// Create a new database with a user-chosen passphrase.
@@ -512,6 +507,56 @@ mod tests {
         let dir = tempdir::TempDir::new("strong");
         let v = vault(&dir);
         assert!(v.is_acceptable(GOOD));
+    }
+
+    #[test]
+    fn the_live_hint_and_the_vault_agree_on_every_candidate() {
+        // The regression this guards: the setup screen coloured its strength bar from
+        // entropy alone while `is_acceptable` rejected on warning text, so a passphrase
+        // could show a green bar and still be refused. Both now derive from the same
+        // assessment, and this asserts they cannot drift apart again.
+        let dir = tempdir::TempDir::new("agree");
+        let v = vault(&dir);
+
+        let candidates = [
+            "",
+            "short",
+            "123456789012",
+            "passwordpassword",
+            "abababababababab",
+            "abcdefghijklmnop",
+            "correcthorsebatterystaple",
+            GOOD,
+            "Tr0ub4dor&3-horse-battery",
+        ];
+
+        for candidate in candidates {
+            let assessment = v.assess(candidate);
+            assert_eq!(
+                v.is_acceptable(candidate),
+                assessment.is_acceptable_for_vault(),
+                "the vault and the assessment disagree about {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_high_entropy_but_obvious_passphrase_is_not_acceptable() {
+        // The exact shape of the reported bug: long enough to score well on entropy,
+        // but on the deny-list. It must be reported as unacceptable so the bar cannot
+        // be green.
+        let dir = tempdir::TempDir::new("entropy-trap");
+        let v = vault(&dir);
+        let assessment = v.assess("passwordpassword");
+
+        assert!(
+            assessment.estimated_entropy_bits >= 60,
+            "this candidate is meant to score well on entropy, got {}",
+            assessment.estimated_entropy_bits
+        );
+        assert!(assessment.is_well_known_weak);
+        assert!(!assessment.is_acceptable_for_vault());
+        assert!(!v.is_acceptable("passwordpassword"));
     }
 
     #[test]

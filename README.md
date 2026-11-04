@@ -175,6 +175,39 @@ limits, and direct/group encryption and persistence boundaries:
 cargo test -p anon-messaging -p anon-ipc
 ```
 
+## Offline Delivery: the Send Queue
+
+A send to an offline peer used to fail outright: there is no server to hold the
+frame, and the transport refuses rather than degrading. That made an offline
+recipient a *lost message*.
+
+The sender now keeps the sealed frame on its own disk and retries it:
+
+- **What is stored.** The already-sealed frame, re-encrypted at rest under a
+  bucket key. The queue never holds plaintext, so it is not a second copy of the
+  message history, and a row that survives a crypto-shred is undecryptable.
+- **When it is used.** Only for *transient* failures — the peer's onion service
+  is not published yet, or our own circuit is still bootstrapping. A permanent
+  failure (a local-only route, an oversized payload, a replay) is reported to the
+  user immediately, because queueing it would only defer an identical failure.
+- **When it is not used.** A build with no Tor transport cannot ever deliver, so
+  it refuses rather than queueing. Queueing there would promise a delivery that
+  cannot happen.
+- **How long it lives.** Bounded by the message's own 90-day retention deadline,
+  not by an attempt count. A frame still inside the window is still worth sending.
+- **What the UI says.** A queued frame is `queued_local` — "queued", never
+  "delivered". The transport header shows the queue depth, and the send result
+  says the message will go out when the peer is reachable.
+
+Retries are driven by a timer in the shell (`drain_send_queue`), with a per-frame
+backoff so a permanently unreachable peer does not cause a tight loop. A failed
+attempt forgets the frame's id in the replay guard, so a retry is not mistaken for
+a duplicate.
+
+```powershell
+cargo test -p anon-messaging --test send_queue
+```
+
 ## Architecture
 
 ```mermaid
@@ -331,6 +364,22 @@ winget install StrawberryPerl.StrawberryPerl
 
 Without Perl the build fails with `openssl-sys: Command 'perl' not found`.
 
+### Linux prerequisite (Debian / Ubuntu)
+
+The same vendored-OpenSSL build applies, so `perl` and `libssl-dev` are required.
+The Tauri shell additionally needs WebKitGTK 4.1 and GTK 3:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential pkg-config libssl-dev perl \
+  libgtk-3-dev libwebkit2gtk-4.1-dev \
+  libayatana-appindicator3-dev librsvg2-dev \
+  libfuse2 file
+```
+
+`libfuse2` is only needed to *run* the AppImage; it is not a build dependency.
+
 ### Build and test
 
 ```powershell
@@ -347,6 +396,19 @@ cargo build -p anon-transport --features arti   # embed Arti
 
 The default build has no Arti and therefore **cannot transmit** — that is the
 fail-closed default, not an oversight.
+
+### Linux packages
+
+The bundle config produces a `.deb` and an AppImage on Linux:
+
+```bash
+cargo build -p anon-app --release
+npx --yes @tauri-apps/cli@^2 bundle --bundles deb,appimage
+```
+
+Artifacts land in `target/release/bundle/deb/` and
+`target/release/bundle/appimage/`. The `linux` CI job builds and uploads both, so
+a Linux-only break fails a pull request rather than a release.
 
 ---
 

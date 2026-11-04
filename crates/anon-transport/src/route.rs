@@ -122,6 +122,18 @@ impl PeerRoute {
         matches!(self.kind, RouteKind::OnionRendezvous)
     }
 
+    /// The onion address this route targets, when it is an onion route.
+    ///
+    /// Exposed so a caller that must persist a route (the send queue) can store
+    /// the address itself rather than a display string it would have to parse
+    /// back out.
+    pub fn onion_target(&self) -> Option<&str> {
+        match self.kind {
+            RouteKind::OnionRendezvous => Some(&self.target),
+            RouteKind::Local => None,
+        }
+    }
+
     /// Human-readable description for logs. Contains no secret material — an
     /// onion address is public by nature.
     pub fn describe(&self) -> String {

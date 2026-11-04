@@ -206,8 +206,16 @@ function scheduleStrengthCheck() {
       const pct = Math.min(100, Math.round((view.entropy_bits / 128) * 100));
       const fill = $("strength-fill");
       fill.style.width = `${pct}%`;
-      fill.dataset.level =
-        view.entropy_bits >= 80 ? "strong" : view.entropy_bits >= 50 ? "fair" : "weak";
+
+      // Colour from *acceptance*, not from entropy. A long-but-obvious passphrase
+      // ("passwordpassword") has high estimated entropy and is still refused by the
+      // vault, so colouring by entropy alone produced a green bar over a rejected
+      // passphrase. The bar must never look better than the policy allows.
+      fill.dataset.level = !view.acceptable
+        ? "weak"
+        : view.entropy_bits >= 80
+          ? "strong"
+          : "fair";
 
       $("strength-text").textContent = view.acceptable
         ? `Estimated ${view.entropy_bits} bits — acceptable.`
@@ -391,7 +399,11 @@ async function refreshTransport() {
 
   try {
     const view = await invoke("transport_view");
-    $("send").disabled = !view.can_send || sendInFlight;
+    // Sending stays enabled while the transport is merely *not ready yet*: the
+    // frame is queued and retried, so disabling the button would hide a working
+    // path. It is disabled only when the transport can never carry a frame.
+    const queueable = view.anonymity === "tor_onion";
+    $("send").disabled = (!view.can_send && !queueable) || sendInFlight;
     el.dataset.state = view.status;
     text.textContent =
       view.status === "ready"
@@ -399,6 +411,10 @@ async function refreshTransport() {
           ? "Tor Online"
           : "Tor Publishing…"
         : `${view.status}`;
+
+    if (view.queued_count > 0) {
+      text.textContent += ` · ${view.queued_count} queued`;
+    }
 
     if (view.can_send) {
       banner.hidden = true;
@@ -1082,8 +1098,13 @@ async function sendMessage() {
 
   try {
     const state = await invoke("send_message", { request });
-    result.textContent = `✓ ${state.label ?? state}`;
-    result.classList.add("ok");
+    // "Queued" is not "delivered": say so plainly rather than showing a checkmark
+    // for a frame that has not left the device yet (`plan.md` §8).
+    const queued = state.code === "queued_local";
+    result.textContent = queued
+      ? `⏳ ${state.label} — will send when the peer is reachable`
+      : `✓ ${state.label ?? state}`;
+    result.classList.add(queued ? "hint" : "ok");
     $("body").value = "";
     clearStagedAttachment();
     await refreshConversations();
@@ -1965,6 +1986,28 @@ function startRefreshLoops() {
     }
   }, 3000);
   setInterval(refreshConsent, 3000);
+  // Retry queued frames. The backend applies its own per-frame backoff, so a
+  // short interval here is cheap: most passes find nothing due and return.
+  setInterval(drainSendQueue, 5000);
+}
+
+/**
+ * Ask the backend to retry queued frames, refreshing the open conversation when
+ * something actually went out.
+ */
+async function drainSendQueue() {
+  try {
+    const sent = await invoke("drain_send_queue");
+    if (sent > 0) {
+      await refreshConversations();
+      if (selectedConversationId) {
+        await refreshConversationMessages(selectedConversationId);
+      }
+    }
+  } catch {
+    // A failed drain is not worth surfacing: the frames stay queued and the next
+    // pass retries. The transport banner already explains why sending is blocked.
+  }
 }
 
 async function refreshPrivacy() {
