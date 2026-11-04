@@ -1,0 +1,132 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: build, test, lint
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # SQLCipher is built with the vendored-OpenSSL feature, so OpenSSL is
+      # compiled from source and needs Perl (see README). GitHub's Windows
+      # runners ship Strawberry Perl, so this is usually already satisfied;
+      # the check makes a missing Perl an explicit, early failure rather than
+      # a confusing openssl-sys error.
+      - name: Verify build prerequisites
+        shell: pwsh
+        run: |
+          $perl = Get-Command perl -ErrorAction SilentlyContinue
+          if (-not $perl) {
+            Write-Host "Perl is not installed; installing Strawberry Perl." -ForegroundColor Yellow
+            choco install strawberryperl -y --no-progress
+          }
+          perl --version
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The Arti backend is behind a feature flag, so the default clippy/test run
+      # never compiles it. Without this step a break in the Tor transport would
+      # only surface when someone built with `--features arti`.
+      - name: Clippy (Arti feature)
+        run: cargo clippy -p anon-transport --features arti --all-targets -- -D warnings
+
+      # The Tauri shell needs WebView2 headers at build time. GitHub's
+      # windows-latest image ships them; splitting the step out makes a shell-only
+      # break obvious rather than buried inside a workspace build.
+      - name: Build (Tauri shell)
+        run: cargo build -p anon-app
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Test (Arti feature)
+        run: cargo test -p anon-transport --features arti
+
+      # plan.md §7.1/§10: the no-clearnet invariant must be checked in CI,
+      # not only by a test a developer might skip locally.
+      - name: No-clearnet guard
+        shell: pwsh
+        run: ./scripts/check-no-clearnet.ps1
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Security audit
+        run: cargo audit
+
+  # The `check` job above uses `@stable`, so the declared `rust-version` is never
+  # actually built. That is how the workspace came to declare 1.85 while its own
+  # dependency tree required 1.92: nothing ever compiled the declared minimum, so the
+  # declaration could drift without a single red build. This job pins the declared MSRV
+  # so a dependency bump that raises the real minimum fails here instead of surprising a
+  # user on an older toolchain.
+  #
+  # Keep the version below in lockstep with `rust-version` in the workspace Cargo.toml.
+  msrv:
+    name: build at declared MSRV
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.92 (the declared MSRV)
+        uses: dtolnay/rust-toolchain@1.92.0
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Verify build prerequisites
+        shell: pwsh
+        run: |
+          $perl = Get-Command perl -ErrorAction SilentlyContinue
+          if (-not $perl) {
+            Write-Host "Perl is not installed; installing Strawberry Perl." -ForegroundColor Yellow
+            choco install strawberryperl -y --no-progress
+          }
+          perl --version
+
+      # A build is enough: if the declared MSRV cannot compile the workspace, the
+      # declaration is wrong. Running the full suite here would double CI time for no
+      # extra signal about the MSRV itself.
+      - name: Build at MSRV
+        run: cargo build --workspace
+
+      # The Arti backend is the dependency that actually sets the MSRV (safelog 1.92),
+      # so it must be compiled here or this job would not catch the case it exists for.
+      - name: Build at MSRV (Arti feature)
+        run: cargo build -p anon-transport --features arti

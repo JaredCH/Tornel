@@ -1,0 +1,93 @@
+[package]
+name = "anon-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anon-core.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+# Diagnostics. Arti emits its bootstrap stages as `tracing` events; without the facade
+# linked here those events are compiled out of our view and a stuck bootstrap is
+# indistinguishable from a silent one (Gap 3).
+tracing.workspace = true
+# The subscriber that actually prints those events. Lives here rather than in each binary
+# so the CLI and the app install the same one, and so the "silent unless RUST_LOG" rule is
+# written once. See `src/logging.rs`.
+tracing-subscriber.workspace = true
+
+# The real Tor backend is opt-in so the core build has no Arti dependency.
+# See plan.md §3.4: Arti is pre-1.0, so it stays behind a feature flag and a
+# trait boundary (`AnonymityTransport`) rather than leaking into messaging code.
+#
+# Feature notes (verified against arti-client 0.47.0's own source):
+#
+# * `onion-service-service` is what enables `TorClient::launch_onion_service`,
+#   i.e. actually *hosting* a v3 onion service (`plan.md` §3.2).
+# * `onion-service-client` is required *in addition* even though we do not use
+#   the client API: arti-client 0.47.0's `create_onion_service` path references
+#   `KeystoreSelector`, which is only re-exported under
+#   `all(onion-service-client, experimental-api)`. Without it the crate fails to
+#   compile with "use of undeclared type KeystoreSelector". This is an upstream
+#   feature-gating bug, not a choice of ours.
+# * `experimental-api` is required because `launch_onion_service` is gated on it.
+# * `onion-service-cli-extra` enables `TorClient::keymgr`, which we use to
+#   confirm the onion identity key is persisted (D7).
+# * `bridge-client` enables the bridge configuration surface (`BridgesConfig`,
+#   `BridgeConfigBuilder`) so a user behind a censoring network can supply bridge
+#   lines. Without it the bridge types are not compiled in at all.
+# * `pt-client` additionally enables pluggable transports (obfs4, snowflake, ...),
+#   which is what makes a bridge line with a transport prefix usable. It pulls in
+#   `tor-ptmgr`, which is not otherwise in the tree.
+arti-client = { version = "0.47.0", optional = true, features = [
+    "onion-service-service",
+    "onion-service-client",
+    "experimental-api",
+    "onion-service-cli-extra",
+    "bridge-client",
+    "pt-client",
+] }
+# Arti's runtime abstraction and the async runtime it runs on. Both are needed
+# explicitly by `src/arti.rs`; relying on Arti's re-exports would couple us to
+# its internal module layout, which is exactly what §3.4 warns about.
+tor-rtcompat = { version = "0.47.0", optional = true, features = ["tokio", "native-tls"] }
+# Onion-service configuration types (`OnionServiceConfig`, `HsNickname`).
+tor-hsservice = { version = "0.47.0", optional = true }
+tor-cell = { version = "0.47.0", optional = true }
+tor-persist = { version = "0.47.0", optional = true }
+# `HsId` (the onion service identity) intentionally has no `Display` impl so that
+# accidental logging is redacted. The full `${base32}.onion` form is opt-in via
+# `safelog::DisplayRedacted::display_unredacted`, which is how we obtain the
+# address to hand to the UI.
+safelog = { version = "0.10.0", optional = true }
+tokio = { version = "1", optional = true, features = ["io-util", "rt", "time"] }
+futures = { version = "0.3", optional = true }
+# Required only to unify features, not to use directly.
+#
+# `tor-dirmgr` (via `arti-client`) depends on `rusqlite`, which by default links
+# a *system* `sqlite3` and fails with `LNK1181: cannot open input file
+# 'sqlite3.lib'`. Namely: cargo unifies features per build, so when
+# `anon-transport` is built on its own with `--features arti`, nothing in that
+# dependency tree asks for a bundled SQLite. Taking the workspace's `rusqlite`
+# here — which is configured with `bundled-sqlcipher` — forces the bundled build
+# into the tree and makes the link succeed.
+rusqlite = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables the embedded Arti transport. Phase 2 target.
+arti = [
+    "dep:arti-client",
+    "dep:tor-rtcompat",
+    "dep:tor-hsservice",
+    "dep:tor-cell",
+    "dep:tor-persist",
+    "dep:safelog",
+    "dep:tokio",
+    "dep:futures",
+    "dep:rusqlite",
+]
+
+[dev-dependencies]

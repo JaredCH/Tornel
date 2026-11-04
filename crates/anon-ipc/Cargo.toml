@@ -1,0 +1,35 @@
+[package]
+name = "anon-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The Tauri-facing command surface (plan.md §7.3).
+#
+# This crate deliberately has NO Tauri dependency so it can be unit-tested
+# without a webview. It defines the command DTOs, the validation rules, and the
+# backend facade; the Tauri binary is a thin adapter over it.
+#
+# Hard rule (plan.md §7.3): no private key, seed, or DB handle ever crosses this
+# boundary. Values here are rendered content and opaque handles only.
+
+[dependencies]
+anon-core.workspace = true
+anon-storage.workspace = true
+anon-messaging.workspace = true
+anon-consent.workspace = true
+anon-transport.workspace = true
+# Group lifecycle. The backend creates, adds to, and removes from MLS groups, so it
+# needs the group API directly rather than only through `anon-messaging`.
+anon-mls.workspace = true
+thiserror.workspace = true
+getrandom.workspace = true
+blake3.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+hex.workspace = true

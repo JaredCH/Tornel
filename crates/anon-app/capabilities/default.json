@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The minimum capability set for the anon shell. Deliberately narrow: the webview may call only the commands this app defines, and nothing from a plugin. plan.md §7.3 treats every command as attack surface, so the allow-list is explicit and short.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

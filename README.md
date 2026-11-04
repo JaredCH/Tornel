@@ -1,0 +1,574 @@
+# Tornel (`anon`) — Serverless, 100% Tor v3 Onion P2P Messenger
+
+A Rust + Tauri v2 desktop and mobile communication application built around **zero application-operated servers**, **100% Tor v3 onion-service rendezvous routing** (via embedded Arti), **authenticated end-to-end encryption** (X25519 + Ed25519 for 1-on-1, RFC 9420 MLS for groups with role-based permissions), **encrypted inline image & file sharing**, and **local-only SQLCipher storage with a mandatory 90-day crypto-shredding retention ceiling**.
+
+> **Security Status & Audit Notice:** Embedded Arti bootstrap, v3 onion-service descriptor publication, and authenticated two-peer 1-on-1 and MLS group message/attachment delivery over Tor rendezvous have been verified end-to-end (both standalone and alongside an active Tor Browser daemon on ports `9150`/`9151`). However, this software has not yet undergone a formal third-party cryptographic or network-anonymity audit. Review the **Mitigated vs. Remaining Risks** section below before relying on it in high-adversary environments.
+
+The full engineering blueprint is in [plan.md](./plan.md).
+
+---
+
+## Threat Model: Risks We Mitigate vs. Remaining Risks (100% Tor & Non-Identifiability)
+
+Overstating protection in an anonymity tool is itself a hazard (`plan.md` §2.4, §11). Below is the explicit breakdown of what this architecture **mitigates** and what **remains a risk** when operating as a Tor-only, zero-identifier messenger.
+
+### Risks Mitigated by Design
+
+| Risk / Attack Vector | How Tornel Mitigates It |
+| --- | --- |
+| **Central server compromise, subpoena, or metadata logging** | **Zero central servers.** There is no user registry, no account server, no push-notification relay, and no central message broker. Peers address each other directly via Bech32m cryptographic contact codes (`anon1…`) and Tor v3 `.onion` hidden services. |
+| **Clearnet IP leakage / accidental fallback** | **Structural Fail-Closed Transport Gate.** `AnonymityTransport::send` refuses to transmit unless `AnonymityClass == TorOnion` and `TransportStatus == Ready` with a published v3 onion service. Builds without `--features tor` use `OfflineTransport`, which fails closed. Enforced by compile-time/CI source scans (`no_clearnet.rs` and `scripts/check-no-clearnet.ps1`) that forbid `std::net`/`tokio::net` sockets outside the Arti wrapper. |
+| **Exposing your IP address to a chat peer or group member** | **Bidirectional Tor v3 Onion Rendezvous.** Every running instance hosts its own Tor v3 hidden service via embedded Arti. Outbound and inbound connections meet at a Tor Rendezvous Point over a 6-hop onion circuit—neither peer ever learns the other's IP address or physical network location. |
+| **Phone number, email, or username correlation** | **Self-Sovereign Cryptographic Identity.** No phone numbers, emails, or global usernames exist. Your identity is an Ed25519 signing keypair + X25519 agreement keypair generated locally from OS entropy and encoded into a self-checksummed Bech32m contact code (`anon1…`). Display names are strictly local labels. |
+| **Coexistence conflicts with Tor Browser or system Tor** | **Isolated Embedded Arti Runtime.** The app embeds Arti directly with `SocksPort 0` / `ControlPort 0` and per-profile state (`<data_dir>/arti/state` and `arti/cache`). It works whether or not Tor is installed on the host and never collides with an active Tor Browser session on ports `9150`/`9151` or `9050`/`9051`. |
+| **Ciphertext length analysis (distinguishing short messages from files/images)** | **Fixed-Bucket AEAD Frame Padding.** Every wire frame (text, image, file, or MLS payload) is padded prior to encryption into fixed size buckets (`512 B`, `2 KiB`, `8 KiB`, `32 KiB`, `128 KiB`, `512 KiB`) with the bucket authenticated in the ChaCha20-Poly1305 AEAD header. |
+| **Disk forensics &stolen data directory backups** | **User-Held Passphrase + OS Keychain.** The SQLCipher database key is derived via Argon2id (`64 MiB`, 3 passes) from a passphrase you enter at launch—never stored on disk. The identity seed is stored in the OS Keychain (Windows Credential Manager / macOS Keychain / Linux Secret Service). |
+| **Historical data retention & SSD wear-leveling recovery** | **Mandatory 90-Day TTL + Monthly Crypto-Shredding.** Every content table (`messages`, `conversations`, `attachments`, `mailbox_buffer`, `consent_log`) enforces `STRICT` integer `expires_at` deadlines. Beyond SQL `DELETE` + `VACUUM`, row ciphertexts are encrypted under per-month HKDF bucket keys that are permanently destroyed once a month ages past 90 days, rendering surviving flash blocks undecryptable. |
+| **Compromised or removed group member reading future messages** | **RFC 9420 MLS Ratcheting + Human-in-the-Loop Consent.** Group membership changes advance the MLS epoch and derive fresh tree secrets (`openmls`), locking removed leaves out of future messages. Sensitive rotations trigger a nonce-bound, Ed25519-signed consent modal before taking effect. |
+
+### Remaining Risks & Operational Limitations
+
+| Remaining Risk | Why It Exists & What You Must Consider |
+| --- | --- |
+| **Global Passive Adversary / End-to-End Timing & Volume Correlation** | **Tor is a low-latency anonymity network.** While frames are padded to fixed byte buckets, an adversary observing both your network link (or Guard node) and your peer's network link at the same time can correlate packet burst timing and volume. Tornel does **not** generate constant-rate cover traffic (chaff). |
+| **ISP / Local Network Detection of Tor Usage** | While your ISP cannot see *who* you are talking to or *what* onion service you connect to, they can see that you are connecting to public Tor relays unless you configure **Tor Bridges** (`Bridge obfs4 …` + `UseTransport` in `tor.conf` or `ANON_TOR_BRIDGES`). If bridges are configured, Tornel fails closed if they are unreachable rather than falling back to direct Tor relays. |
+| **Long-Lived Identity & `.onion` Linkability Across Contacts** | By default, an install uses a single persistent contact code (`anon1…`) and a single persistent v3 `.onion` service (`ONION_SERVICE_NICKNAME = "anon"`). If you share the same Invite Bundle with two different people, or post it publicly, they can prove they are talking to the same pseudonymous entity. Use separate profile directories (`ANON_DATA_DIR`) when you require unlinkable personas. |
+| **Public v3 Onion Reachability (Lack of Per-Peer Client Auth — D8)** | Standard v3 onion descriptors are encrypted on HsDirs using the public `.onion` address key. Anyone who possesses your 56-character `.onion` address can attempt to open a rendezvous stream to your service (though unauthenticated frames are dropped before touching storage). Restricted-discovery Tor client authorization (`KS_hsc_desc_enc`) is not yet wired. |
+| **Endpoint Compromise / Malware on an Unlocked Device** | SQLCipher and the OS Keychain protect data **at rest**. While the application is unlocked and running, decrypted keys and message plaintexts necessarily exist in process memory (mitigated on drop via `zeroize`, but exposed to root/user-level malware, screen capture, or memory dumps while live). |
+| **Attachment Metadata Inside Shared Files** | When you share an image or document over Tor, Tornel encrypts and pads the file in transit and at rest, but it does **not** strip internal file metadata (such as camera EXIF GPS tags, PDF author properties, or original filenames) before sending. Sanitize files before attaching if your peer is untrusted. |
+| **Non-Repudiation (No Plausible Deniability)** | Direct messages are signed with your Ed25519 identity key (`ANM1` envelope) and group messages are signed with your MLS leaf signature key to prevent forgery and impersonation. A recipient who decrypts a message can cryptographically prove to a third party that your public key signed it (`plan.md` §9.5, §13). |
+| **Asynchronous Offline Delivery Requires Online Rendezvous** | Because there are no central servers, sending a direct or group message requires both the sender's and recipient's Tor v3 onion services to be online simultaneously (until peer-hosted mailbox sync is wired to automatic background polling). |
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TB
+  UI["Webview — presentation + consent only"] --> APP["anon-app — Tauri shell"]
+  APP --> IPC["anon-ipc — command boundary"]
+    IPC --> MSG["anon-messaging — framing, delivery, replay, mailbox host"]
+  IPC --> CON["anon-consent — rotation gate"]
+    MSG --> MLS["anon-mls — MLS group ratcheting"]
+    MSG --> TR["anon-transport — AnonymityTransport"]
+    MSG --> ST["anon-storage — SQLCipher + TTL + mailbox"]
+    CON --> ST
+    MLS --> ST
+    TR --> ART["Arti (feature-gated): client + onion service"]
+    TR --> OFF["OfflineTransport (fails closed)"]
+    ST --> KR["KeyRing — per-month keys, crypto-shredding"]
+    CORE["anon-core — keys, codes, escrow, retention"] -.-> ST
+    CORE -.-> CON
+    CORE -.-> IPC
+  ```
+
+  ### Crates
+
+  | Crate | Responsibility | Plan sections |
+  | --- | --- | --- |
+  | `anon-core` | Ed25519/X25519 identity, Bech32m contact codes, escrow, retention math | §2, §6 |
+  | `anon-storage` | SQLCipher store, `STRICT` schema, 90-day purge, crypto-shredding, peer mailbox | §6, §4.4 |
+  | `anon-transport` | `AnonymityTransport` trait, onion routes, fail-closed gate, Arti client + onion service | §3 |
+  | `anon-mls` | RFC 9420 group ratcheting over `openmls`, persisted into the same SQLCipher file | §4.2, §4.3 |
+  | `anon-messaging` | Wire format, padding, replay protection, delivery, group messaging, mailbox policy | §9, §4.4 |
+  | `anon-consent` | Signed rotation proposals, consent gate, audit log | §5 |
+  | `anon-ipc` | The Rust↔webview boundary and its validation | §7.3 |
+  | `anon-app` | The Tauri v2 desktop shell: command adapter + webview. No crypto. | §7.3 |
+  | `anon-cli` | `anon-demo`, a two-process walkthrough of the stack | §7.1 |
+
+  ### Why `anon-mls` is separate from `anon-messaging`
+
+  `plan.md` §3.4 names Arti as the highest-risk dependency and §4.2 names MLS as the
+  highest-complexity one. Keeping each behind its own crate and its own trait
+  boundary means either can be replaced without touching the wire format: the frame
+  layer does not know what produced its payload, and the ratchet does not know how
+  its ciphertext travels. That is also why `anon-messaging` takes MLS state through
+  a provider rather than owning a database handle.
+
+---
+
+## The three guarantees, and how they are enforced
+
+### 1. No clearnet fallback — enforced, not documented
+
+`plan.md` §1.2 says there is no mode that degrades to direct TCP/IP. That is
+enforced in three places:
+
+- `AnonymityClass::permits_internet_routing()` returns `true` **only** for
+  `TorOnion`. `AnonymityTransport::send` refuses otherwise.
+- Sending over a local route is a hard error, not a fallback
+  (`MessageError::LocalRouteNotDeliverable`).
+- A build with no Tor backend gets `OfflineTransport`, which **fails closed**.
+
+And it is *verified* by an automated guard, not just by review:
+
+```powershell
+cargo test -p anon-transport --test no_clearnet   # source scan for direct sockets
+.\scripts\check-no-clearnet.ps1                   # repository-wide CI scan
+```
+
+### 2. 90-day retention — enforced, not asserted
+
+Two bugs in the original design were found and fixed before implementation
+(`plan.md` §6.1, §6.2):
+
+**The purge query was silently a no-op.** `strftime('%s','now','-90 days')`
+returns a *string of digits*. Compared against a text timestamp column, that is
+string comparison, so retention would appear enforced while deleting nothing.
+Fixed by:
+
+- all times are `INTEGER` epoch seconds;
+- every row carries a precomputed absolute `expires_at`;
+- tables are `STRICT`, so SQLite rejects the type confusion outright;
+- purge filters the indexed `expires_at`, never a re-derived window.
+
+**`VACUUM` is not a physical erase.** It is logical compaction; flash
+wear-levelling and the FTL can retain old blocks. It is therefore *not* the
+primary control. Message ciphertext is encrypted under a **per-month data key**;
+when a month ages past the ceiling the key is destroyed, making surviving
+ciphertext **cryptographically unrecoverable** regardless of filesystem
+behaviour. `secure_delete` and `VACUUM` remain as secondary layers.
+
+Retention covers **every** content table — messages, conversations, attachments,
+mailbox buffers, and the consent audit log — and a test fails if a new content
+table is added without an `expires_at` column (`plan.md` §6.4, §6.5).
+
+### 3. Consent is a security control, not a notification
+
+`plan.md` §5.2's six constraints are enforced structurally:
+
+- **Fail closed** — a denied *or expired* rotation leaves an explicit
+  `rotation_stale` state; `is_forward_secret()` goes false and
+  `assert_forward_secret()` turns that into a hard error. Ignoring the prompt
+  never silently continues.
+- **Backend owns the truth** — the frontend can only decide a proposal the
+  backend already issued. `ConsentSubmission` has no epochs, no names, and no
+  keys, so it *cannot* express anything but "yes" or "no".
+- **Signed payload** — the proposal is Ed25519-signed over exactly the fields the
+  user sees, so the modal displays verifiable text.
+- **Replay-safe** — a proposal has a nonce and a one-shot decision; a second
+  submission is rejected, and the nonce handle is consumed on use.
+- **Bounded wait** — expiry is recorded as a *decision*, never as approval.
+- **Audited** — every decision is logged with its proposal id.
+
+**Consent fatigue (decision D4):** prompting on everything trains users to click
+through. Only member-removal and manual rotations **block**; routine rotations are
+**batchable**.
+
+---
+
+## Identity and addressing
+
+Two things that look similar are kept strictly apart:
+
+- **Contact code** — `anon1...`, Bech32m over
+  `version ‖ ed25519_pubkey ‖ x25519_pubkey ‖ BLAKE3 checksum`. This is the
+  durable thing a human copies. It is *not* a Tor address.
+- **Onion address** — `...onion`. Routing only. A real v3 address is
+  `base32(SHA3-256(pubkey ‖ blinded_pubkey ‖ version)[..35]).onion`, produced by
+  the onion service and rotatable. **Treating an onion address as an identity
+  would be a security bug.**
+
+Display names are local aliases. They are unauthenticated: two peers can claim the
+same name. The contact code is the only durable identifier.
+
+### Escrow (optional, user-held)
+
+There is no server, no cloud, and no recovery code the app can regenerate. If you
+choose recovery, the app produces an AEAD-encrypted artifact (Argon2id, mobile-
+calibrated, parameters stored in the header) that **you** store. The app never
+persists it. Storing it in a cloud drive makes that drive your escrow agent.
+
+---
+
+## Building
+
+Requires Rust **1.92+**, as specified by the workspace.
+
+### Windows prerequisite
+
+SQLCipher is built with the `bundled-sqlcipher-vendored-openssl` feature, so
+OpenSSL is compiled from source and **Perl is required**:
+
+```powershell
+winget install StrawberryPerl.StrawberryPerl
+```
+
+Without Perl the build fails with `openssl-sys: Command 'perl' not found`.
+
+### Build and test
+
+```powershell
+cargo build
+cargo test --workspace
+.\scripts\check-no-clearnet.ps1
+```
+
+The Tor transport is **feature-gated**:
+
+```powershell
+cargo build -p anon-transport --features arti   # embed Arti
+```
+
+The default build has no Arti and therefore **cannot transmit** — that is the
+fail-closed default, not an oversight.
+
+---
+
+## Dependency constraints worth knowing
+
+Three pins are deliberate and will break the build if changed casually:
+
+- **`rusqlite` is pinned to 0.37.** Three crates constrain it and only one version
+  satisfies all of them: `arti-client` (via `tor-dirmgr`) requires
+  `>=0.36, <0.41`, and `openmls_sqlite_storage` requires `0.37`. Two `rusqlite`
+  versions in one graph would link two different `libsqlite3-sys`, and cargo
+  rejects that outright because both declare `links = "sqlite3"`. 0.37 is the
+  intersection. Bumping it requires re-checking both ranges.
+- **`argon2` 0.6 has no `std` feature**; it uses `zeroize`. Passing `std` fails
+  resolution.
+- **`arti-client` needs `onion-service-client` even to *host*.** Its
+  `create_onion_service` path references `KeystoreSelector`, which is only
+  re-exported under `all(onion-service-client, experimental-api)`. Enabling
+  `onion-service-service` alone fails to compile with "use of undeclared type
+  `KeystoreSelector`". That is an upstream feature-gating bug, not a choice here;
+  the feature list in `crates/anon-transport/Cargo.toml` documents it.
+
+Also note `rand_core` 0.10 removed `OsRng`. Randomness comes from
+`getrandom::fill`, which is also what lets escrow export the raw seed.
+
+Arti is pre-1.0 and onion-service *hosting* (`tor-hsservice`) is its least mature
+surface (`plan.md` §3.4). Every Arti call is meant to stay behind
+`AnonymityTransport`.
+
+---
+
+## Repository layout
+
+```
+Cargo.toml                 workspace, pinned dependencies
+plan.md                    the engineering blueprint (source of truth)
+crates/anon-core/          identity, contact codes, escrow, retention
+crates/anon-storage/       SQLCipher store, schema, purge, crypto-shredding, mailbox
+crates/anon-transport/     transport abstraction, Arti client + onion service, no-clearnet guard
+crates/anon-mls/           MLS group ratcheting over openmls
+crates/anon-messaging/     wire format, delivery, replay protection, group + mailbox policy
+crates/anon-consent/       rotation proposals, consent gate, audit
+crates/anon-ipc/           Rust↔webview boundary
+crates/anon-app/           Tauri v2 shell (command adapter + webview/UI)
+crates/anon-cli/           anon-demo: two-process walkthrough
+scripts/check-no-clearnet.ps1
+```
+
+---
+
+## Status
+
+**Implemented and tested (344 tests in the default build, more with the feature flags, all green):**
+
+| Area | What works |
+| --- | --- |
+| Identity | Ed25519 + X25519 keygen, deterministic derivation, signing/verification, fingerprints |
+| **Keychain** | The identity seed lives in the **OS keychain** (Windows Credential Manager / macOS Keychain / Linux Secret Service) via `keyring` 4.2.0. A legacy `identity.seed` file is migrated on first launch — written, **read back and compared byte-for-byte**, then deleted. An unavailable keychain is **fatal**: the app refuses to start rather than writing a plaintext seed. A seed conflict between keychain and file is fatal too, because picking either would discard a contact code the user may have shared |
+| **User-held passphrase** | The database key comes from a passphrase **you** choose and type on every launch. Nothing machine-held remains: `db.passphrase` is gone. An existing install is migrated by a **resumable copy-then-swap rekey** — the copy is opened with the new passphrase and its row counts compared against the original before anything is replaced, so a crash at any stage leaves the original intact. Verified against a **real** 256 KiB install: all 24 tables' row counts identical before and after, old key rejected, `db.passphrase` deleted |
+| Contact codes | Bech32m encode/decode, BLAKE3 checksum, version gate, low-order and undecodable key rejection |
+| Escrow | AEAD artifact with Argon2id, header bound as associated data, passphrase assessment, export/import round-trip |
+| Retention | Absolute expiry math, clock-skew resistance, boundary semantics, restart-durable live-bucket set |
+| Storage | SQLCipher store, `STRICT` schema, per-table purge, crypto-shredding key ring, schema audit |
+| Transport | `AnonymityTransport` gate, onion route validation, fail-closed `OfflineTransport`, automated no-clearnet guard |
+| Messaging | Padded frame format, AEAD header binding, replay/duplicate rejection, delivery states |
+| **Groups (MLS)** | RFC 9420 ratcheting via `openmls`: create/add/remove, epoch advance, key-package validation, join from Welcome, state persisted in the same SQLCipher file. **Removal is tested to lock the removed member out** (`removed_member_cannot_decrypt`), which is the §7.1 Phase 4 exit criterion |
+| **Group Chat & Roles UI** | Full SimpleX-style 2-pane chat workspace with a collapsible **Members & Roles** drawer (`Owner`, `Admin`, `Moderator`, `Member`), `group_roles` SQLCipher table, MLS-encrypted role sync (`set_member_role`), KeyPackage generation (`generate_key_package`), Join-from-Welcome (`join_group`), and MLS-encrypted group chat + file/image fan-out over Tor (`send_group_message`). A member removal **drafts the rotation proposal** and opens the consent modal. |
+| **Mailbox** | Peer-hosted offline buffer with per-sender byte/count quotas and a per-mailbox total cap enforced *before* any write, host-side TTL through the shared purge, AAD-bound so a host cannot rewrite recipient/sender/expiry, and receipts that can never be mistaken for delivery |
+| Consent | Signed proposals, one-shot nonce binding, expiry-as-decision, fail-closed stale epoch, audit log |
+| IPC | Boundary DTOs, input validation, secret-handle indirection, and a **drift guard that parses `dto.rs`** and fails if a field is not in the reviewed inventory or is named like secret material (negative-tested by planting `private_seed`, which failed three independent checks) |
+| **Arti** | Feature-gated client bootstrap, outbound length-prefixed onion connection with application-layer receipt, and v3 onion-service hosting via `tor-hsservice` (`--features arti`). Verified end-to-end across two isolated Arti profiles and alongside an active Tor Browser daemon: onion addresses persist across restarts, descriptors publish (`State::Running`), and inbound rendezvous streams deliver authenticated frames to the encrypted SQLCipher store. |
+| **Bootstrap deadline** | `bootstrap()` returns at a deadline (default 120s, `ANON_TOR_BOOTSTRAP_TIMEOUT_SECS`). A cooperative async timeout is backed by an outer thread deadline. If the underlying operation does not yield or stop, a worker can outlive that deadline; retries should use a new transport and may encounter a state lock until the worker exits. |
+| **Tor diagnostics** | A `tracing` subscriber installed by `anon_transport::init_tracing()` in both the CLI and the app, **silent unless `RUST_LOG` is set**. `RUST_LOG=arti_client=debug,tor_dirmgr=info` prints bootstrap stages. An absent or blank `RUST_LOG` is silent; a malformed one warns on stderr rather than failing the launch |
+| **Bridges** | `TorConfig` + `tor.conf` / `ANON_TOR_BRIDGES` for users behind a censoring network. Bridge lines are validated before a client is built, and **bridges requested but unusable is an error, never a silent fallback to a direct connection** — falling back would be a privacy failure. A malformed line, an unknown directive, or a bridge whose pluggable transport has no configured binary all fail closed |
+| **Tauri shell** | Real desktop app in `crates/anon-app`: launches, renders identity/messages/consent, and reports failures honestly. Verified by running it (see below). The adapter holds no crypto — it deserializes, calls one backend method, serializes |
+
+**Not yet implemented:**
+
+- **Restricted-discovery onion addresses for 1-on-1 (D8).** Ordinary v3 services
+  are hosted; restricted discovery needs per-peer Tor client-authorization key provisioning.
+- **Automated background polling of peer-hosted offline mailboxes.** The `Mailbox` and `MailboxHost` storage/quota engines are implemented and tested in `anon-storage` and `anon-messaging`, but live chat delivery currently targets online peers directly over Tor rendezvous.
+
+### The Tauri shell
+
+`crates/anon-app` is a real Tauri v2 desktop app that builds and launches:
+
+```
+cargo build -p anon-app          # offline transport: refuses to send, says why
+cargo build -p anon-app --features tor
+cargo run -p anon-app
+```
+
+Verified by launching it: the window opens, `identity_view` returns a live Bech32m
+contact code and fingerprint, the transport banner explains why sending is
+unavailable, the Messages tab renders, and pressing Send surfaces the backend's
+validation error (`[invalid_input] a required field was empty: conversation_id`)
+with its stable code.
+
+### The app starts locked, and that is the point
+
+The user-held passphrase changed startup structurally. The app no longer opens its
+database at launch — it cannot, because there is nothing to open it with until you
+type your passphrase. Startup now decides *which screen to show* and hands the webview
+a vault to act on:
+
+| State | Screen |
+| --- | --- |
+| No database | "Choose a passphrase" |
+| Database + `db.passphrase` | "Choose a passphrase for this device" — explains that the existing key is being replaced and the messages are kept |
+| Database, no `db.passphrase` | "Unlock" |
+| A rekey marker on disk | "Finishing a passphrase change", naming the stage it stopped at |
+
+Every command that touches user data goes through `AppState::backend()`, which returns
+a `locked` error until one of the three vault commands succeeds. That is the
+enforcement: there is no backend to call, so there is no path that reads a message
+without the passphrase.
+
+**Verified by launching it against a real existing install.** The data directory held
+`anon.db` (262,144 bytes), `anon.db.salt`, and `db.passphrase`. After launching:
+
+```
+=== before launch ===        === after launch ===
+anon.db       262144         anon.db       262144
+anon.db.salt      16         anon.db.salt      16
+db.passphrase     64         db.passphrase     64
+```
+
+Byte-unchanged. The app **did not migrate unattended** — it showed the migration
+screen and waited. That is the behaviour the old build lacked: it opened the database
+with a machine-held key and never asked.
+
+**The migration itself is verified against that same real database**, not a synthetic
+one. `crates/anon-app/tests/real_migration.rs` copies the install, migrates it, and
+asserts every table's row count is identical before and after:
+
+```
+row counts before: [("groups", 1), ("openmls_group_data", 10), ("openmls_epoch_keys_pairs", 1),
+                    ("openmls_signature_keys", 1), ("schema_meta", 4), ... 24 tables]
+row counts after:  [ ... identical ... ]
+groups after migration: 1
+```
+
+It also asserts the machine-held passphrase is rejected afterwards, the user passphrase
+opens the database, `db.passphrase` is deleted, and no `.rekey-*` artifacts remain. Run
+it with `ANON_REAL_MIGRATION_DIR` set to a real install.
+
+### The honest cost of the passphrase
+
+**The app no longer starts without a login.** Every launch asks for the passphrase.
+That is a real usability regression, and it is the direct price of the security
+improvement: the key is no longer sitting next to the database, which means it has to
+come from you.
+
+There is also **no recovery**. If you forget the passphrase, the message history is
+unreadable — that is what makes it protection rather than a formality. Your *identity*
+is separate: it lives in the OS keychain and can be restored from an escrow artifact,
+so a forgotten database passphrase costs you history, not your contact code.
+
+The migration needs free space for a full second copy of the database, because it
+copies rather than rewriting in place. That is deliberate: an in-place `PRAGMA rekey`
+has no rollback, and this is a database with no server-side backup.
+
+**The Groups tab is verified against the real database, not just in unit tests.**
+A harness opened the actual `anon.db` the shell created — production Argon2id
+parameters, the real `db.passphrase` file — and ran the same backend calls the
+webview issues. It created a group, read its member list, listed it, then **reopened
+the file** and confirmed the row was still on disk:
+
+```
+-- create_group --
+  group_id    : f9d6e97444341936b6da3c8c073dc676
+  name        : Some("verification group")
+  epoch       : 0
+  member_count: 1
+-- group_members --
+  leaf 0  anon1qys23ta…  self=true
+-- persistence: reopen the file and list again --
+  1 group row(s) on disk
+  the created group is on disk: true
+-- error shapes the UI branches on --
+  empty name    -> [invalid_input] a required field was empty: name
+  unknown group -> [unknown_group] no group with that id is stored on this device
+  bad group id  -> [invalid_group_id] the group id could not be parsed: the group id must be hexadecimal
+```
+
+The harness was deleted after use; the evidence is the transcript above. What this
+does **not** prove is delivery: adding a member produces a Welcome, but with no
+completed Tor bootstrap there is nowhere to send it.
+
+### The keychain migration, verified on a real install
+
+The migration was exercised against the actual data directory this machine had been
+using, not a synthetic one. Before launch it held `identity.seed` with seed
+`8e63f49f08973e54…`. After launching the app once:
+
+```
+=== after launch ===
+anon.db        262144
+anon.db.salt       16
+db.passphrase      64
+identity.seed still present? False
+```
+
+Reading the seed back out of Windows Credential Manager gave
+`8e63f49f08973e54e2c3c4f70a9053b19dfa19a906e00e698a25b8a1617d7b55` — **byte-identical
+to the file that was deleted**, so the contact code did not change. A second launch
+confirmed the identity is stable with the file gone.
+
+The real keychain round-trip is also covered by opt-in tests
+(`ANON_KEYCHAIN_TEST=1 cargo test -p anon-app keychain::tests::the_os_keychain`), which
+pass on Windows Credential Manager. They are opt-in because they would otherwise
+clobber a developer's real identity.
+
+Three bugs this surfaced, all fixed:
+
+1. **`window.__TAURI__` was never injected.** Tauri 2 defaults
+   `withGlobalTauri` to `false`, so every command failed silently and the page
+   rendered placeholder dashes forever. Now enabled, and `main.js` fails loudly if
+   the bridge is missing rather than looking alive but being deaf.
+2. **Serde renamed every DTO field.** A blanket
+   `#[serde(rename_all = "camelCase")]` made the wire use `contactCode` while the
+   JS read `contact_code`, so the contact code rendered blank. Removed: the wire
+   now uses the same names as the Rust fields, which is also what the boundary
+   inventory checks.
+3. **Tauri converts command arguments to camelCase.** `invoke("export_escrow",
+   {passphrase})` needed `rename_all = "snake_case"` on the commands to match the
+   DTO fields the frontend sends.
+
+### A second bug this work found and fixed
+
+The IPC boundary guard was documented in `anon-ipc`'s lib docs but its test file
+never existed, so nothing was enforcing it. Writing it immediately found real
+drift: `PeerView.contact_code` and `HandleView.handle` were crossing the boundary
+unreviewed, and the inventory still listed a `state` field that no longer exists.
+Both are fixed, and the guard is negative-tested.
+
+### A bug this work found and fixed
+
+Bucket keys are *derived*, not stored (§6.2). That made the "which buckets are
+live" set the only record that a key may still be derived — and it was in-memory
+only. The consequence was that **every message written before an app restart
+became unreadable**, because the ring started empty and every older row looked
+like it belonged to a shredded bucket. Nothing errored at write time; the loss
+only appeared on the next launch. The set is now persisted in `live_buckets` with
+a `retired_at` column, so shredding also survives a restart instead of being
+undone by one. Both directions are pinned by regression tests
+(`a_message_survives_a_restart_and_is_still_readable`,
+`a_shredded_bucket_is_not_resurrected_by_a_restart`).
+
+**Known schedule risk:** mobile distribution (§8). Anonymity tools have been
+rejected or removed from major app stores, and decision D6 puts mobile in v1, so
+this needs validating early rather than at submission time.
+
+---
+
+## How to verify Tor bootstrap and live P2P onion messaging
+
+These probes require access to the live Tor network.
+
+### 1. Ask Tor where it gets to
+
+The app uses its own embedded Arti client; it neither requires nor reuses an
+installed Tor daemon or an active Tor Browser session. It does not open a
+local SOCKS or control port. Each app data directory has its own `arti/state`
+and `arti/cache`; two instances should use different data directories. A second
+instance sharing one profile can encounter Arti state locks. Bridges, configured
+separately for this app, may still require an installed pluggable-transport
+executable. No configuration automatically copies Tor Browser's bridges.
+
+```powershell
+$env:RUST_LOG = "arti=debug"
+$env:ANON_TOR_BOOTSTRAP_TIMEOUT_SECS = "60"
+cargo run -p anon-cli --features tor -- tor-probe
+```
+
+Pass a data directory (`tor-probe <dir>`) to have it read `<dir>/tor.conf`; without
+one it uses `ANON_TOR_BRIDGES` only. The probe loads bridges through the same
+`TorConfig` path the app uses, so a bridge misconfiguration fails here rather than
+being silently ignored.
+
+`RUST_LOG` is the only switch. With it unset the command is silent apart from its
+own result line — a diagnostic switch must not add noise to a normal run.
+
+On a network that works you will see the percentage climb and then:
+
+```text
+BOOTSTRAPPED — status Ready
+launched onion service at <56-character-base32>.onion (publication and delivery unverified)
+```
+
+To verify **full two-peer onion service publication, rendezvous, X25519 encryption,
+Ed25519 signature verification, and SQLCipher persistence**:
+
+```powershell
+cargo run -p anon-cli --features tor -- tor-e2e-chat .\peer-a .\peer-b "Hello over Tor!"
+```
+
+On the Windows development machine, an unpatched Arti dependency previously
+spun while parsing the directory consensus. The workspace temporarily patches
+`saturating-time` 0.5.0 using the MIT-licensed source in `vendor/saturating-time`:
+it stops limit searches when a sub-resolution operation makes no progress and
+computes saturation bounds lazily. With this patch, isolated Arti profiles
+reach 100% bootstrap, publish v3 onion descriptors (`State::Running`), and
+exchange authenticated encrypted messages over Tor rendezvous both when no
+external Tor is running and when Tor Browser's `tor.exe` is actively running on
+ports `9150`/`9151`. Remove the override only after a fixed upstream release has
+been verified, including on Windows.
+
+### 2. Run the gated integration test
+
+```powershell
+$env:ANON_TOR_E2E = "1"
+$env:ANON_TOR_BOOTSTRAP_TIMEOUT_SECS = "120"
+cargo test -p anon-transport --features arti --test tor_e2e -- --nocapture
+```
+
+Without the environment variable the live test does not run. When explicitly
+enabled, it bootstraps two isolated Arti clients, hosts an onion service, waits
+for descriptor publication (`is_onion_service_reachable()`), and verifies live
+payload delivery over Tor rendezvous.
+
+### 3. If consensus download fails
+
+In order of likelihood:
+
+1. **Tor may be blocked or the network may be unreliable.** Try a bridge. Put this in `tor.conf` in the app's
+   data directory (or set `ANON_TOR_BRIDGES`):
+   ```text
+   Bridge obfs4 <host>:<port> <fingerprint> cert=<cert> iat-mode=0
+   UseTransport obfs4=C:\path\to\obfs4proxy.exe
+   ```
+   A bridge line whose transport has no configured binary is an **error**, not a
+   silent fallback to a direct connection — see the Bridges row in the status table.
+2. **A captive portal or firewall.** Check network access and system clock;
+   Arti needs working connections to Tor relays or configured bridges.
+3. **A very slow link.** Raise `ANON_TOR_BOOTSTRAP_TIMEOUT_SECS`. The default is
+   120s; a healthy bootstrap takes seconds to tens of seconds.
+
+### What is and is not claimed
+
+| Claim | Status |
+| --- | --- |
+| The bootstrap path runs, reports stages, and **returns** at a deadline | **Verified** — unit tests plus the CLI probe above |
+| A bootstrap that cannot finish fails closed with a reason | **Verified** — `a_bootstrap_returns_at_the_deadline_instead_of_hanging` |
+| Bridge configuration is validated and fails closed when unusable | **Verified** — 15 `tor_config` tests plus `bootstrap_fails_closed_when_bridges_are_unusable` |
+| An onion service is published, reachable, and delivers authenticated frames | **Verified** — `tor_e2e` and `anon-demo tor-e2e-chat` over the live Tor network |
+
+---
+
+## Build environment notes
+
+This repository was built and verified on Windows with:
+
+- Rust 1.92 (workspace MSRV 1.92)
+- Visual Studio 2022 with the MSVC toolchain
+- Strawberry Perl 5.42 (required by `openssl-sys`; see above)
+
+If Perl is unavailable and cannot be installed system-wide, the portable ZIP from
+the Strawberry Perl releases page works without an installer — extract it and put
+`perl\bin` on `PATH` for the build.

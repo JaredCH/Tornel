@@ -1,0 +1,25 @@
+[package]
+name = "anon-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+blake3.workspace = true
+bech32.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+chacha20poly1305.workspace = true
+argon2.workspace = true
+rand_core.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

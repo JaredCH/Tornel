@@ -1,0 +1,32 @@
+[package]
+name = "anon-mls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anon-core.workspace = true
+anon-storage.workspace = true
+
+# MLS (RFC 9420) group ratcheting. `plan.md` §4.2 requires a vetted protocol
+# rather than a hand-rolled group key, and names `openmls` explicitly.
+#
+# The `sqlite-provider` feature pulls in `openmls_sqlite_storage`, which persists
+# group state (epoch secrets, ratchet tree, proposal store) into a `rusqlite`
+# connection. That connection is the *same* SQLCipher connection the rest of the
+# app uses, so MLS state is encrypted at rest by the same key and covered by the
+# same retention rules — no second database, no second key.
+openmls = { version = "0.9.2", features = ["sqlite-provider"] }
+openmls_traits = "0.6.0"
+openmls_rust_crypto = "0.6.0"
+openmls_basic_credential = "0.6.0"
+openmls_sqlite_storage = "0.3.0"
+rusqlite.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

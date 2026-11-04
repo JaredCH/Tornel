@@ -1,0 +1,61 @@
+[package]
+name = "anon-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tauri v2 shell over the anon-ipc boundary (plan.md §7.3)"
+
+# The Tauri binary is a *thin adapter*. Every rule that matters — validation,
+# the anonymity gate, consent binding, retention — lives in the crates below it
+# and is tested without a webview. This crate's job is to translate Tauri
+# commands into `anon_ipc::Backend` calls and to render the results.
+#
+# Hard rule (plan.md §7.3): no private key, seed, or DB handle crosses into the
+# webview. The commands here return only `anon_ipc` DTOs, which cannot hold
+# secret material by construction.
+
+# The library holds every rule; the binary is a three-line entry point. Tauri's
+# mobile targets need the lib crate types, and desktop gets them for free.
+[lib]
+name = "anon_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# A distinct bin name avoids Cargo's output-filename collision between the lib
+# (`anon_app`) and a bin (`anon-app`) that would otherwise both emit `anon_app.pdb`
+# on Windows. It also matches `productName` in tauri.conf.json.
+[[bin]]
+name = "anon"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anon-core.workspace = true
+anon-storage.workspace = true
+anon-transport.workspace = true
+anon-messaging.workspace = true
+anon-consent.workspace = true
+anon-ipc.workspace = true
+
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror.workspace = true
+zeroize.workspace = true
+# Used to derive the frame key in Rust so the webview never supplies key material.
+hkdf.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+# The OS keychain for the identity seed (plan.md §2.3). The `v1` feature selects the
+# all-in-one facade that picks Windows Credential Manager / Keychain / Secret Service
+# automatically. Deliberately NOT the `cli` feature: its own docs say it "saddles an
+# application with a lot of dependent modules it won't need".
+keyring = { version = "4.2.0", features = ["v1"] }
+
+[features]
+default = []
+# The Tor edition. Without this the app runs on the fail-closed OfflineTransport,
+# which is the honest default: it refuses to send rather than pretending.
+tor = ["anon-transport/arti"]

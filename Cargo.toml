@@ -1,0 +1,98 @@
+[workspace]
+resolver = "2"
+exclude = ["vendor/saturating-time"]
+members = [
+    "crates/anon-core",
+    "crates/anon-storage",
+    "crates/anon-transport",
+    "crates/anon-mls",
+    "crates/anon-messaging",
+    "crates/anon-consent",
+    "crates/anon-ipc",
+    "crates/anon-cli",
+    "crates/anon-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/anon"
+
+[workspace.dependencies]
+# --- cryptography (Phase 1) ---
+# NOTE: ed25519-dalek 3.0 gates `SigningKey::generate` behind `rand_core`.
+ed25519-dalek = { version = "3.0.0", features = ["rand_core", "zeroize"] }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
+blake3 = "1.8.7"
+bech32 = "0.12.0"
+zeroize = { version = "1.9.1", features = ["zeroize_derive"] }
+subtle = "2.6.1"
+hkdf = "0.13.0"
+sha2 = "0.11.0"
+hex = "0.4.3"
+
+# --- AEAD / password KDF (Phase 1 escrow, Phase 3 DB) ---
+# NOTE: argon2 0.6 has no `std` feature; `zeroize` wipes KDF intermediates.
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+argon2 = { version = "0.6.0", features = ["zeroize"] }
+
+# --- randomness ---
+# NOTE: rand_core 0.10 dropped `OsRng`; `getrandom::fill` is the OS entropy
+# source. We also need the raw seed for escrow export (§2.5), so we take entropy
+# ourselves rather than through a generator wrapper.
+rand = "0.10.3"
+rand_core = "0.10.1"
+getrandom = "0.4.3"
+
+# --- storage (Phase 3) ---
+# NOTE: pinned to 0.36 deliberately. `arti-client` (via `tor-dirmgr`) requires
+# `rusqlite >=0.36, <0.41`, and two `rusqlite` versions in one graph would link
+# two different `libsqlite3-sys`, which cargo rejects outright — both crates
+# declare `links = "sqlite3"`. 0.36 is the only version that unifies with Arti's
+# requirement (both resolve to `libsqlite3-sys` 0.34). Do not bump without first
+# confirming Arti's range, or the build fails at resolution time.
+# `backup` is needed for the resumable rekey (Gap 2): the copy is made through
+# SQLite's online backup API so it lands encrypted under the destination's key.
+rusqlite = { version = "0.37.0", features = ["bundled-sqlcipher-vendored-openssl", "blob", "backup"] }
+
+# --- errors / misc ---
+thiserror = "2.0.21"
+time = "0.3.55"
+
+# --- diagnostics ---
+# Arti logs its bootstrap stages through `tracing`. Without a subscriber those events
+# are discarded, which is why an earlier Tor diagnosis produced an empty log and looked
+# like a silent hang (Gap 3). `tracing` is the facade; `tracing-subscriber` is the
+# implementation, installed once per process behind `RUST_LOG`.
+#
+# `env-filter` is what makes `RUST_LOG=arti=debug` work. Its dependencies (`matchers`,
+# `regex-automata`, `nu-ansi-term`, `sharded-slab`, `thread_local`) are already in the
+# lockfile via Arti's own tree, so enabling it adds no new downloads.
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+# --- workspace members ---
+anon-core = { path = "crates/anon-core" }
+anon-storage = { path = "crates/anon-storage" }
+anon-transport = { path = "crates/anon-transport" }
+anon-mls = { path = "crates/anon-mls" }
+anon-messaging = { path = "crates/anon-messaging" }
+anon-consent = { path = "crates/anon-consent" }
+anon-ipc = { path = "crates/anon-ipc" }
+anon-cli = { path = "crates/anon-cli" }
+anon-app = { path = "crates/anon-app" }
+
+[profile.release]
+# Security posture over binary size for the crypto paths.
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[patch.crates-io]
+# Windows SystemTime has 100ns resolution; 0.5.0 can spin while finding limits.
+# Remove this patch when a fixed upstream release is available.
+saturating-time = { path = "vendor/saturating-time" }

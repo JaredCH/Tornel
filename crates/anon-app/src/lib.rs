@@ -1,0 +1,246 @@
+//! The Tauri v2 shell (`plan.md` §7.3).
+//!
+//! # What this crate is
+//!
+//! The desktop application: a webview for presentation and consent, and a thin
+//! Rust adapter over [`anon_ipc::Backend`]. Everything that matters — identity,
+//! encryption, the anonymity gate, retention, consent binding — lives in the
+//! crates below and is tested without a webview.
+//!
+//! ```text
+//! webview (HTML/CSS/JS)   presentation + consent only
+//!        |  Tauri IPC
+//! anon-app                THIS CRATE: command adapter, no crypto
+//!        |
+//! anon-ipc                Backend facade, DTOs, validation
+//!        |
+//! core / storage / transport / mls / messaging / consent
+//! ```
+//!
+//! # Why the adapter is deliberately boring
+//!
+//! `plan.md` §7.3 calls every command an attack surface. The defence is not
+//! cleverness here — it is that this layer is too small to hide a bypass in. Each
+//! command deserializes, calls one backend method, and serializes. If a rule needs
+//! enforcing, it is enforced below.
+//!
+//! # Startup
+//!
+//! [`run`] opens the encrypted store, loads or creates the identity, builds the
+//! backend, and starts the background tasks that must not live in the webview:
+//! the retention purge timer and (with the `tor` feature) the Tor bootstrap.
+//!
+//! # The identity seed lives in the OS keychain
+//!
+//! `plan.md` §2.3 requires the private seed to live in the OS keychain (Windows
+//! Credential Manager, macOS Keychain, Linux Secret Service). [`keychain`] provides it
+//! and [`identity_store`] owns the policy: create on first launch, migrate a legacy
+//! plaintext file, and **refuse to start** when the keychain is unavailable rather than
+//! falling back to a file.
+//!
+//! # The database passphrase is still machine-held
+//!
+//! Closing that is Gap 2 of the gap-closure plan. Until then the app starts without a
+//! login screen, and the README says what that costs.
+
+pub mod commands;
+pub mod identity_store;
+pub mod keychain;
+pub mod vault;
+
+use anon_storage::{Argon2Params, Store};
+use anon_transport::AnonymityTransport;
+// Only the non-`tor` build constructs the offline transport; importing it
+// unconditionally would warn on the `tor` build.
+#[cfg(not(feature = "tor"))]
+use anon_transport::OfflineTransport;
+use commands::AppState;
+use keychain::KeychainBackend;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tauri::Manager;
+
+/// How often the retention purge runs (`plan.md` §6.4: on launch and every 24h).
+const PURGE_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// Build and run the application.
+///
+/// Returns the Tauri error type so `main.rs` can report a startup failure rather
+/// than panicking — a panic in a security-sensitive app is a bad failure mode.
+pub fn run() -> tauri::Result<()> {
+    // Install the tracing subscriber first, so Arti's bootstrap stages are visible when
+    // `RUST_LOG` asks for them. Silent by default. See `anon_transport::logging`: without
+    // this, a stuck Tor bootstrap produces an empty log and looks like a silent hang.
+    anon_transport::init_tracing();
+
+    // When `ANON_DATA_DIR` is set for running multiple instances side by side, also point
+    // WebView2 (`WEBVIEW2_USER_DATA_FOLDER`) into a subdirectory of that profile if not
+    // already overridden, so two instances do not contend on the same Chromium user-data folder.
+    if let Ok(custom_dir) = std::env::var("ANON_DATA_DIR") {
+        let trimmed = custom_dir.trim();
+        if !trimmed.is_empty() && std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
+            let wv_dir = PathBuf::from(trimmed).join("webview2");
+            let _ = std::fs::create_dir_all(&wv_dir);
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", wv_dir);
+        }
+    }
+
+    tauri::Builder::default()
+        .setup(|app| {
+            let state = build_state(app.handle())?;
+            if let Ok(title) = std::env::var("ANON_WINDOW_TITLE") {
+                if !title.trim().is_empty() {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.set_title(title.trim());
+                    }
+                }
+            }
+            app.manage(state);
+            Ok(())
+        })
+        .pipe(commands::register)
+        .run(tauri::generate_context!())
+}
+
+/// Build the application state.
+///
+/// # The app starts locked
+///
+/// Startup no longer opens the database. It cannot: the passphrase is user-held, so there
+/// is nothing to open it with until the user supplies one. What startup does instead is
+/// decide *which screen to show* — setup, migration, or unlock — and hand the webview a
+/// vault it can act on.
+///
+/// This is the structural change Gap 2 required. The previous build opened the store here
+/// using a machine-held secret, which meant the app started without a login and the
+/// at-rest encryption was decorative. See [`vault`] for the full reasoning.
+///
+/// # What is still fatal here
+///
+/// The keychain check. An unavailable keychain means the identity seed cannot be read or
+/// stored safely, and the app must not start in a mode that would write a plaintext seed.
+/// That check runs before the window opens so the failure is reported rather than
+/// discovered later.
+fn build_state(handle: &tauri::AppHandle) -> Result<AppState, Box<dyn std::error::Error>> {
+    let data_dir = app_data_dir(handle)?;
+    std::fs::create_dir_all(&data_dir)?;
+
+    // The keychain must be usable before anything else. Checking here rather than at
+    // unlock time means a broken keychain is reported at launch, not after the user has
+    // typed a passphrase and expected to get in.
+    let keychain = keychain::OsKeychain::new();
+    if !keychain.available() {
+        return Err(
+            "the OS keychain is unavailable; refusing to start rather than \
+                    fall back to a plaintext seed file"
+                .into(),
+        );
+    }
+
+    // The vault owns the passphrase policy and the database path. It holds no secret.
+    let vault = vault::Vault::new(&data_dir, Argon2Params::mobile_default());
+
+    // A rekey interrupted by a crash must be finished before the app can open the
+    // database. The vault reports that state so the launch screen can say where it
+    // stopped rather than "please wait".
+    if vault.migration_in_progress() {
+        eprintln!(
+            "anon: a passphrase migration was interrupted; the launch screen will \
+             offer to finish it"
+        );
+    }
+
+    Ok(AppState::locked(vault, data_dir))
+}
+
+/// Build the transport for this build.
+///
+/// With `--features tor` this is the embedded Arti client; without it, the
+/// fail-closed offline transport. The offline transport is not a stub — it is the
+/// control that makes "the app is offline rather than degraded" the default.
+///
+/// Public because the unlock commands build a backend after the user supplies their
+/// passphrase, and the transport is part of that backend. Building it once at startup and
+/// reusing it would mean a Tor bootstrap started before the user was even authenticated.
+pub fn build_transport(data_dir: &std::path::Path) -> Arc<dyn AnonymityTransport> {
+    #[cfg(feature = "tor")]
+    {
+        let config = match anon_transport::TorConfig::load(data_dir) {
+            Ok(config) => config.with_data_dir(data_dir),
+            Err(error) => {
+                eprintln!("anon: Tor configuration failed: {error}");
+                return Arc::new(anon_transport::OfflineTransport::new(error.to_string()));
+            }
+        };
+        let t = Arc::new(anon_transport::arti::ArtiTransport::with_config(config));
+        // Bootstrap on a background thread: it can take minutes and must never
+        // block the UI (`plan.md` §7.3: long-running work lives in Rust tasks).
+        let bg = t.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = bg.bootstrap() {
+                eprintln!("anon: Tor bootstrap failed: {e}");
+                return;
+            }
+            if let Err(e) = bg.host_onion_service() {
+                eprintln!("anon: onion service hosting failed: {e}");
+            }
+        });
+        t
+    }
+    #[cfg(not(feature = "tor"))]
+    {
+        let _ = data_dir;
+        Arc::new(OfflineTransport::new(
+            "this build has no Tor backend; rebuild with --features tor",
+        ))
+    }
+}
+
+/// Run the retention purge every 24 hours.
+///
+/// Deliberately a plain thread rather than an async task: the purge is blocking
+/// SQLite work, and putting it on the async runtime would stall the reactor.
+///
+/// Called from [`commands::AppState::install`] rather than at startup, because the store
+/// does not exist until the user unlocks. The store's own `purge_on_open` handles the
+/// launch-time purge; this timer covers the 24h cadence after that.
+pub(crate) fn spawn_purge_timer(store: Arc<Store>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(PURGE_INTERVAL_SECS));
+        let now = store.now();
+        match store.purge(now) {
+            Ok(report) if !report.is_empty() => {
+                eprintln!(
+                    "anon: retention purge removed {} row(s), shredded {} bucket(s)",
+                    report.total_deleted(),
+                    report.shredded_buckets.len()
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("anon: retention purge failed: {e}"),
+        }
+    });
+}
+
+/// The per-user data directory, or `ANON_DATA_DIR` when running isolated multi-instance previews.
+fn app_data_dir(handle: &tauri::AppHandle) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Ok(override_dir) = std::env::var("ANON_DATA_DIR") {
+        let trimmed = override_dir.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+    handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("could not resolve the app data directory: {e}").into())
+}
+
+/// Small extension so the builder chain reads top-to-bottom.
+trait Pipe: Sized {
+    fn pipe<F: FnOnce(Self) -> Self>(self, f: F) -> Self {
+        f(self)
+    }
+}
+
+impl<T> Pipe for T {}

@@ -1,0 +1,18 @@
+/target
+/.vscode
+**/*.rs.bk
+Cargo.lock.orig
+
+# Tauri generates these from tauri.conf.json + capabilities/ at build time.
+# Committing them would mean a stale schema silently disagreeing with the config.
+crates/anon-app/gen/
+
+# Secrets and local database files must never be committed (see plan.md §2.3).
+*.key
+*.seed
+*.escrow
+*.db
+*.db.salt
+*.passphrase
+.env
+.env.*

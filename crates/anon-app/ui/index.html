@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>anon — Tor Messenger</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <!--
+      The webview renders presentation and collects consent. It performs no
+      cryptography and holds no key material (plan.md §7.3). Every value on this
+      page arrived as a plain DTO from anon-ipc; the only thing this page can do
+      that affects the backend is call a command.
+    -->
+
+    <!-- Launch Screen (Vault Unlock / Setup / Migration) -->
+    <div id="launch" class="launch">
+      <div class="launch-card">
+        <div class="brand-hero">
+          <span class="onion-mark"></span>
+          <div>
+            <h1>anon</h1>
+            <p class="subtitle">Serverless Tor v3 Onion Messenger · SQLCipher · 90-Day TTL</p>
+          </div>
+        </div>
+
+        <!-- Fresh install / migration: choose a passphrase -->
+        <div id="launch-setup" hidden>
+          <h2 id="setup-title">Choose a vault passphrase</h2>
+          <p id="setup-explain" class="hint"></p>
+
+          <div class="row">
+            <input
+              id="setup-passphrase"
+              type="password"
+              autocomplete="new-password"
+              placeholder="Vault passphrase (16+ characters)"
+              spellcheck="false"
+            />
+          </div>
+          <div class="row">
+            <input
+              id="setup-confirm"
+              type="password"
+              autocomplete="new-password"
+              placeholder="Confirm passphrase"
+              spellcheck="false"
+            />
+          </div>
+
+          <div id="strength" class="strength" hidden>
+            <div class="strength-bar"><span id="strength-fill"></span></div>
+            <p id="strength-text" class="hint small"></p>
+            <ul id="strength-warnings" class="warnings"></ul>
+          </div>
+
+          <div class="row">
+            <button id="setup-submit" class="primary-full">Create Encrypted Vault</button>
+          </div>
+          <p id="setup-result" class="hint small"></p>
+
+          <p class="hint small security-footnote">
+            Zero recovery by design: Argon2id derives your SQLCipher key in memory on each launch.
+            Never stored on disk.
+          </p>
+        </div>
+
+        <!-- Normal launch: enter the passphrase -->
+        <div id="launch-unlock" hidden>
+          <h2>Unlock Local Vault</h2>
+          <p class="hint">
+            Enter your device passphrase to decrypt SQLCipher storage and start embedded Arti Tor.
+          </p>
+          <div class="row">
+            <input
+              id="unlock-passphrase"
+              type="password"
+              autocomplete="current-password"
+              placeholder="Vault passphrase"
+              spellcheck="false"
+            />
+          </div>
+          <div class="row">
+            <button id="unlock-submit" class="primary-full">Unlock &amp; Connect Tor</button>
+          </div>
+          <p id="unlock-result" class="hint small"></p>
+        </div>
+
+        <!-- Interrupted migration -->
+        <div id="launch-interrupted" hidden>
+          <h2>Finishing a passphrase change</h2>
+          <p class="hint">
+            A passphrase change was interrupted. The database is intact — enter the new passphrase to finish.
+          </p>
+          <dl class="kv">
+            <dt>Stopped at</dt>
+            <dd><code id="interrupted-stage"></code></dd>
+          </dl>
+          <div class="row">
+            <input
+              id="interrupted-passphrase"
+              type="password"
+              autocomplete="current-password"
+              placeholder="New passphrase"
+              spellcheck="false"
+            />
+          </div>
+          <div class="row">
+            <button id="interrupted-submit" class="primary-full">Finish Migration</button>
+          </div>
+          <p id="interrupted-result" class="hint small"></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main Messenger Shell (SimpleX / Signal inspired 2-pane layout) -->
+    <div id="app" hidden>
+      <!-- Left Sidebar -->
+      <aside class="sidebar">
+        <!-- Top Profile & Tor Status Card -->
+        <div class="sidebar-header">
+          <div class="profile-summary" id="open-identity-btn" title="Open Identity, Share Address &amp; Key Backup">
+            <div class="avatar self-avatar" id="self-avatar">A</div>
+            <div class="profile-meta">
+              <div class="profile-name-row">
+                <span id="sidebar-display-name" class="profile-name">Anonymous</span>
+                <span class="tor-pill" id="transport" role="status" aria-live="polite">
+                  <span class="dot"></span>
+                  <span id="transport-text">checking…</span>
+                </span>
+              </div>
+              <div class="profile-sub" id="sidebar-fingerprint">…</div>
+            </div>
+          </div>
+
+          <div class="quick-share-bar">
+            <button id="quick-share-btn" class="action-chip primary-chip" title="Copy your full Invite Bundle (Contact Code + Onion Address)">
+              Share My Invite
+            </button>
+            <button id="open-profile-modal-btn" class="action-chip" title="Identity, KeyPackage &amp; Escrow Backup">
+              Identity &amp; Keys
+            </button>
+            <button id="open-consent-modal-btn" class="action-chip warn-chip" hidden>
+              Consent <span id="consent-badge" class="badge">!</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Quick Action Toolbar (SimpleX style) -->
+        <div class="sidebar-actions">
+          <button id="btn-new-friend" class="sidebar-btn" title="Add a contact by Invite or Contact Code">
+            + Add Friend
+          </button>
+          <button id="btn-new-group" class="sidebar-btn" title="Create a new MLS encrypted group">
+            + Create Group
+          </button>
+          <button id="btn-join-group" class="sidebar-btn" title="Join an MLS group using a Welcome or copy your KeyPackage">
+            Join Group
+          </button>
+        </div>
+
+        <!-- Search & Filter Tabs -->
+        <div class="sidebar-filter">
+          <input id="sidebar-search" type="search" placeholder="Search chats, friends, groups…" spellcheck="false" />
+          <div id="tabs" class="filter-tabs" role="tablist">
+            <button role="tab" data-filter="all" class="filter-tab active" aria-selected="true">All</button>
+            <button role="tab" data-filter="friends" class="filter-tab" aria-selected="false">Friends</button>
+            <button role="tab" data-filter="groups" class="filter-tab" aria-selected="false">Groups</button>
+          </div>
+        </div>
+
+        <!-- Unified Scrollable Lists -->
+        <div class="sidebar-lists">
+          <div id="sidebar-section-chats" class="sidebar-section">
+            <div class="section-label">Direct Chats &amp; Friends</div>
+            <ul id="conversations" class="chat-list"></ul>
+            <ul id="peers" class="chat-list"></ul>
+          </div>
+
+          <div id="sidebar-section-groups" class="sidebar-section">
+            <div class="section-label">MLS Groups</div>
+            <ul id="groups" class="chat-list"></ul>
+          </div>
+        </div>
+
+        <!-- Sidebar Footer: Tor Onion Status -->
+        <div class="sidebar-footer">
+          <div class="footer-onion-row">
+            <span class="shield-icon" title="100% Tor Onion Routed — Zero Clearnet">🛡️</span>
+            <span id="status-line" class="status-line-text">no onion service launched</span>
+            <button id="copy-onion" class="icon-btn" title="Copy your .onion address">Copy .onion</button>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Right Main Workspace (Active Chat / Group View) -->
+      <main class="chat-workspace">
+        <!-- Transport Banner (only shown when sending is blocked/bootstrapping) -->
+        <div id="banner" class="banner" hidden>
+          <strong id="banner-title"></strong>
+          <span id="banner-reason"></span>
+        </div>
+
+        <!-- Empty State (before selecting a chat or group) -->
+        <div id="chat-empty-state" class="chat-empty-state">
+          <div class="empty-card">
+            <div class="onion-mark large"></div>
+            <h2>100% Tor Onion P2P Messenger</h2>
+            <p class="hint">
+              No central servers. No phone numbers. Every message and file is encrypted end-to-end
+              with X25519 / Ed25519 or RFC 9420 MLS, padded into fixed-size ChaCha20-Poly1305 frames,
+              and routed exclusively through Tor v3 hidden service rendezvous circuits.
+            </p>
+            <div class="empty-actions">
+              <button id="empty-add-friend" class="primary-btn">+ Add Friend to Start Chatting</button>
+              <button id="empty-share-invite" class="ghost">Copy My Invite Bundle</button>
+              <button id="empty-create-group" class="ghost">+ Create MLS Group</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Active Direct Conversation View -->
+        <section id="conversation-detail" class="chat-pane" hidden>
+          <header class="chat-header">
+            <div class="chat-header-left">
+              <div class="avatar peer-avatar" id="chat-header-avatar">P</div>
+              <div class="chat-header-info">
+                <div class="chat-title-row">
+                  <h2 id="conversation-detail-title">Conversation</h2>
+                  <span class="e2e-badge" title="Authenticated X25519 + Ed25519 + Padded Frame">🔒 E2EE · Tor v3</span>
+                  <span class="ttl-badge" title="Mandatory 90-day local SQLCipher auto-purge">⏱️ 90d TTL</span>
+                </div>
+                <div class="chat-subtitle-row">
+                  <span>Conv ID: <code id="conversation-detail-id" class="inline-code"></code></span>
+                  <span id="chat-header-onion-status" class="peer-route-pill"></span>
+                </div>
+              </div>
+            </div>
+            <div class="chat-header-actions">
+              <button id="toggle-route-bar" class="ghost small-btn" title="View or edit recipient Tor .onion address">
+                Route / .onion
+              </button>
+            </div>
+          </header>
+
+          <!-- Collapsible Route Bar (auto-filled when peer has a saved .onion, editable anytime) -->
+          <div id="route-bar" class="route-bar" hidden>
+            <label for="recipient-onion">Peer .onion route:</label>
+            <input id="recipient-onion" type="text" placeholder="56-character peer .onion address" spellcheck="false" />
+            <label for="conversation-id">Target ID / Code:</label>
+            <input id="conversation-id" type="text" placeholder="conversation hex id or anon1…" spellcheck="false" />
+            <label for="epoch">Epoch:</label>
+            <input id="epoch" type="number" min="0" value="0" />
+          </div>
+
+          <!-- Scrollable Message Stream -->
+          <div id="messages-scroll" class="messages-scroll">
+            <ul id="conversation-messages" class="message-stream"></ul>
+          </div>
+
+          <!-- Attachment Preview Bar (shown when user picks an image or file before sending) -->
+          <div id="attachment-staging" class="attachment-staging" hidden>
+            <div class="attachment-preview-info">
+              <img id="attachment-thumb" class="attachment-thumb" alt="preview" hidden />
+              <div>
+                <div id="attachment-name" class="attachment-name"></div>
+                <div id="attachment-meta" class="attachment-meta"></div>
+              </div>
+            </div>
+            <button id="attachment-clear" class="ghost small-btn">Remove</button>
+          </div>
+
+          <!-- Bottom Chat Composer -->
+          <footer class="chat-composer">
+            <input id="file-input" type="file" hidden />
+            <button id="attach-btn" class="composer-icon-btn" title="Attach image or file (encrypted &amp; padded over Tor)">
+              📎
+            </button>
+            <textarea
+              id="body"
+              rows="1"
+              maxlength="16384"
+              placeholder="Write an encrypted message… (Enter to send, Shift+Enter for newline)"
+            ></textarea>
+            <button id="send" class="send-btn" disabled>Send</button>
+          </footer>
+          <div class="composer-status-bar">
+            <span id="send-result" class="hint small"></span>
+            <span class="composer-security-hint">Zero clearnet · Padded ChaCha20-Poly1305 frame</span>
+          </div>
+        </section>
+
+        <!-- Active Group Chat View (MLS Group Chat + Roles & Members Drawer) -->
+        <section id="group-detail" class="chat-pane group-pane" hidden>
+          <header class="chat-header">
+            <div class="chat-header-left">
+              <div class="avatar group-avatar">#</div>
+              <div class="chat-header-info">
+                <div class="chat-title-row">
+                  <h2 id="group-detail-title">Group</h2>
+                  <span class="e2e-badge">🔐 MLS RFC 9420</span>
+                  <span class="ttl-badge">Epoch <strong id="group-detail-epoch">0</strong></span>
+                  <span id="group-my-role-badge" class="role-badge role-owner">Owner</span>
+                </div>
+                <div class="chat-subtitle-row">
+                  <span>Group ID: <code id="group-detail-id" class="inline-code"></code></span>
+                  <span>Members: <strong id="group-detail-count">1</strong></span>
+                  <span class="peer-route-pill">🧅 Tor Group Fan-Out</span>
+                </div>
+              </div>
+            </div>
+            <div class="chat-header-actions">
+              <button id="toggle-group-drawer" class="ghost small-btn">
+                👥 Members &amp; Roles
+              </button>
+            </div>
+          </header>
+
+          <div class="group-body-split">
+            <!-- Left/Main: Group Message Stream + Composer -->
+            <div class="group-chat-column">
+              <div id="group-messages-scroll" class="messages-scroll">
+                <ul id="group-messages" class="message-stream"></ul>
+              </div>
+
+              <!-- Group Attachment Staging Bar -->
+              <div id="group-attachment-staging" class="attachment-staging" hidden>
+                <div class="attachment-preview-info">
+                  <img id="group-attachment-thumb" class="attachment-thumb" alt="preview" hidden />
+                  <div>
+                    <div id="group-attachment-name" class="attachment-name"></div>
+                    <div id="group-attachment-meta" class="attachment-meta"></div>
+                  </div>
+                </div>
+                <button id="group-attachment-clear" class="ghost small-btn">Remove</button>
+              </div>
+
+              <!-- Group Chat Composer -->
+              <footer class="chat-composer">
+                <input id="group-file-input" type="file" hidden />
+                <button id="group-attach-btn" class="composer-icon-btn" title="Attach image or file to MLS group">
+                  📎
+                </button>
+                <textarea
+                  id="group-body"
+                  rows="1"
+                  maxlength="16384"
+                  placeholder="Message group (MLS-encrypted &amp; Tor-routed)… (Enter to send)"
+                ></textarea>
+                <button id="group-send" class="send-btn">Send</button>
+              </footer>
+              <div class="composer-status-bar">
+                <span id="group-send-result" class="hint small"></span>
+                <span class="composer-security-hint">MLS RFC 9420 ratcheting · Forward secret</span>
+              </div>
+            </div>
+
+            <!-- Right Drawer: Members, Roles, Add/Remove -->
+            <aside id="group-drawer" class="group-drawer">
+              <div class="drawer-section">
+                <h3>Members &amp; Roles</h3>
+                <p class="hint small">
+                  Roles govern group administration. Owners &amp; Admins can promote/demote members and manage leaves.
+                </p>
+                <ul id="group-members" class="member-role-list"></ul>
+                <p id="role-change-result" class="hint small"></p>
+              </div>
+
+              <div class="drawer-section" id="group-admin-add-section">
+                <h3>+ Invite Member (KeyPackage)</h3>
+                <p class="hint small">
+                  Paste a friend's single-use KeyPackage hex to add them and advance the MLS epoch.
+                </p>
+                <textarea id="key-package" rows="2" placeholder="Invitee KeyPackage (hex)…"></textarea>
+                <div class="row">
+                  <button id="add-member" class="small-btn">Add Member</button>
+                </div>
+                <p id="add-member-result" class="hint small"></p>
+
+                <div id="welcome-out" class="welcome-box" hidden>
+                  <p class="hint small">
+                    Send this <strong>Welcome (hex)</strong> to the invitee so they can join:
+                  </p>
+                  <textarea id="welcome-hex" rows="2" readonly></textarea>
+                  <div class="row">
+                    <button id="copy-welcome" class="ghost small-btn">Copy Welcome Hex</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="drawer-section" id="group-admin-remove-section">
+                <h3>Remove Leaf &amp; Rotate Keys</h3>
+                <div class="row">
+                  <input id="remove-leaf" type="number" min="0" placeholder="Leaf #" />
+                  <button id="remove-member" class="danger small-btn">Remove</button>
+                </div>
+                <p id="remove-member-result" class="hint small"></p>
+              </div>
+            </aside>
+          </div>
+        </section>
+      </main>
+
+      <!-- ===================================================================== -->
+      <!-- Modals / Drawers for Add Friend, Create Group, Join Group, Identity, Consent -->
+      <!-- ===================================================================== -->
+
+      <!-- Modal Backdrop -->
+      <div id="modal-backdrop" class="modal-backdrop" hidden>
+        <!-- 1. Add Friend Modal -->
+        <div id="modal-add-friend" class="modal-card" hidden>
+          <div class="modal-header">
+            <h2>Add Friend (Tor P2P Contact)</h2>
+            <button class="modal-close ghost small-btn" data-close-modal>×</button>
+          </div>
+          <p class="hint">
+            Paste a friend's <strong>Invite Bundle</strong> (`anon1…@….onion`) or paste their Contact Code and `.onion` address separately.
+          </p>
+          <div class="row">
+            <input id="peer-contact-code" type="text" placeholder="Contact code (anon1…) or full invite (anon1…@….onion)" spellcheck="false" />
+          </div>
+          <div class="row">
+            <input id="peer-onion" type="text" placeholder="Peer .onion address (auto-filled if included in invite)" spellcheck="false" />
+          </div>
+          <div class="row">
+            <input id="peer-label" type="text" maxlength="64" placeholder="Friend nickname / display label (e.g. Bob)" />
+          </div>
+          <div class="row modal-footer">
+            <button id="add-peer" class="primary-btn">Save Friend &amp; Open Chat</button>
+            <button class="ghost" data-close-modal>Cancel</button>
+          </div>
+          <p id="add-peer-result" class="hint small"></p>
+        </div>
+
+        <!-- 2. Create Group Modal -->
+        <div id="modal-create-group" class="modal-card" hidden>
+          <div class="modal-header">
+            <h2>Create MLS Encrypted Group</h2>
+            <button class="modal-close ghost small-btn" data-close-modal>×</button>
+          </div>
+          <p class="hint">
+            Creates an RFC 9420 MLS group with forward secrecy and post-compromise security.
+          </p>
+          <div class="row">
+            <input id="group-name" type="text" maxlength="64" placeholder="Group name (e.g. Project Sigma)" />
+          </div>
+          <div class="row modal-footer">
+            <button id="create-group" class="primary-btn">Create Group</button>
+            <button class="ghost" data-close-modal>Cancel</button>
+          </div>
+          <p id="create-group-result" class="hint small"></p>
+        </div>
+
+        <!-- 3. Join Group / KeyPackage Modal -->
+        <div id="modal-join-group" class="modal-card" hidden>
+          <div class="modal-header">
+            <h2>Join MLS Group</h2>
+            <button class="modal-close ghost small-btn" data-close-modal>×</button>
+          </div>
+          <div class="modal-section">
+            <h3>Step 1 — Generate &amp; Share Your Single-Use KeyPackage</h3>
+            <p class="hint small">
+              Generate a one-time MLS KeyPackage and send it to the group admin so they can add you.
+            </p>
+            <div class="row">
+              <button id="generate-kp-btn" class="ghost">Generate My KeyPackage</button>
+              <button id="copy-kp-btn" class="ghost" hidden>Copy KeyPackage</button>
+            </div>
+            <textarea id="my-key-package" rows="3" readonly placeholder="Click 'Generate My KeyPackage'…" hidden></textarea>
+          </div>
+
+          <hr class="modal-divider" />
+
+          <div class="modal-section">
+            <h3>Step 2 — Join with Welcome Package</h3>
+            <p class="hint small">
+              Once the admin adds your KeyPackage and sends you the Welcome hex, paste it below to join:
+            </p>
+            <div class="row">
+              <input id="join-group-name" type="text" maxlength="64" placeholder="Local name for this group (e.g. Project Sigma)" />
+            </div>
+            <div class="row">
+              <textarea id="join-welcome-hex" rows="3" placeholder="Paste Welcome package (hex)…"></textarea>
+            </div>
+            <div class="row modal-footer">
+              <button id="join-group-submit" class="primary-btn">Join Group</button>
+              <button class="ghost" data-close-modal>Close</button>
+            </div>
+            <p id="join-group-result" class="hint small"></p>
+          </div>
+        </div>
+
+        <!-- 4. Identity, Share Invite & Escrow Backup Modal -->
+        <div id="modal-identity" class="modal-card modal-wide" hidden>
+          <div class="modal-header">
+            <h2>Your Cryptographic Identity &amp; Tor Address</h2>
+            <button class="modal-close ghost small-btn" data-close-modal>×</button>
+          </div>
+
+          <div class="modal-section">
+            <h3>Display Name</h3>
+            <div class="row">
+              <input id="display-name" type="text" maxlength="64" placeholder="Local display name (optional)" />
+              <button id="save-name" class="ghost">Save Name</button>
+            </div>
+          </div>
+
+          <div class="modal-section">
+            <h3>One-Click Invite Bundle (Contact Code + Tor .onion)</h3>
+            <p class="hint small">
+              Share this bundle with a friend so they can add both your cryptographic identity and your Tor v3 `.onion` address in one paste:
+            </p>
+            <div class="code-row">
+              <code id="invite-bundle">waiting for Tor…</code>
+              <button id="copy-invite-bundle" class="primary-btn">Copy Invite</button>
+            </div>
+          </div>
+
+          <div class="modal-section">
+            <h3>Contact Code (Ed25519 + X25519 Public Identity)</h3>
+            <div class="code-row">
+              <code id="contact-code">…</code>
+              <button id="copy-code" class="ghost">Copy Code</button>
+            </div>
+            <dl class="kv">
+              <dt>Out-of-Band Fingerprint</dt>
+              <dd id="fingerprint">…</dd>
+              <dt>Your Tor v3 .onion</dt>
+              <dd>
+                <code id="local-onion">starting Tor…</code>
+              </dd>
+            </dl>
+          </div>
+
+          <hr class="modal-divider" />
+
+          <div class="modal-section">
+            <h3>Encrypted Key Backup (Escrow Artifact)</h3>
+            <p class="hint small">
+              Export your identity seed encrypted under a backup passphrase. The app never stores this file.
+            </p>
+            <div id="escrow-state" class="escrow-state"></div>
+            <div class="row">
+              <input id="escrow-passphrase" type="password" placeholder="Backup passphrase" autocomplete="new-password" />
+              <button id="export-escrow" class="ghost">Export Backup</button>
+            </div>
+            <p id="escrow-note" class="hint small"></p>
+          </div>
+        </div>
+
+        <!-- 5. Consent Gate Modal -->
+        <div id="modal-consent" class="modal-card" hidden>
+          <div class="modal-header">
+            <h2>Security Policy &amp; Key Rotation Consent</h2>
+            <button class="modal-close ghost small-btn" data-close-modal>×</button>
+          </div>
+          <p class="hint">
+            Key rotations change who can decrypt group traffic. Explicit user approval is required (`plan.md` §5).
+          </p>
+          <div id="consent-empty" class="empty">No pending rotation proposals.</div>
+          <div id="consent-prompt" hidden>
+            <p id="consent-text" class="prompt-text"></p>
+            <dl class="kv">
+              <dt>Group</dt><dd id="consent-group"></dd>
+              <dt>Reason</dt><dd id="consent-reason"></dd>
+              <dt>Epoch Transition</dt><dd id="consent-epoch"></dd>
+              <dt>Members After</dt><dd id="consent-members"></dd>
+              <dt>Expires</dt><dd id="consent-expires"></dd>
+            </dl>
+            <div class="row modal-footer">
+              <button id="consent-approve" class="danger">Approve Rotation</button>
+              <button id="consent-deny" class="ghost">Deny</button>
+            </div>
+            <p id="consent-result" class="hint small"></p>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script src="main.js"></script>
+  </body>
+</html>

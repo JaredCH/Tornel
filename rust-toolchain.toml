@@ -1,0 +1,13 @@
+[toolchain]
+# Pinned to the MSRV the workspace actually requires, not a rounded-down guess.
+#
+# This is deliberately *not* `stable`: the declared `rust-version` in Cargo.toml
+# must be reproducible, and `stable` silently advances past it. The highest
+# requirement in the tree comes from `arti-client` 0.47.0 (MSRV 1.92); `safelog`
+# also requires 1.92, `openmls` 1.91 and `tauri` 1.90.
+#
+# Bumping this means re-checking every dependency's MSRV — see the README's
+# dependency constraints section. The CI job `msrv` builds with exactly this
+# toolchain so the declaration cannot drift from reality.
+channel = "1.92.0"
+components = ["rustfmt", "clippy"]
