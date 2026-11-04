@@ -147,8 +147,14 @@ jobs:
 
       # Produce the actual installable artifacts (.deb and .AppImage) so a broken
       # bundle config fails here rather than at release time.
+      #
+      # `tauri build` (not `tauri bundle`) is what compiles the app and then
+      # packages it; `bundle` alone expects an already-built binary and would
+      # silently package a stale one. It must run from the crate directory so the
+      # CLI finds `tauri.conf.json`.
       - name: Bundle (deb + AppImage)
-        run: cargo build -p anon-app --release && npx --yes @tauri-apps/cli@^2 bundle --bundles deb,appimage
+        run: npx --yes @tauri-apps/cli@^2 build --bundles deb,appimage --ci
+        working-directory: crates/anon-app
 
       - name: Upload Linux bundles
         uses: actions/upload-artifact@v4
