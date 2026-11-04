@@ -222,6 +222,27 @@ pub fn privacy_view(state: State<'_, AppState>) -> UiResult<anon_ipc::PrivacyVie
     state.backend()?.privacy_view().map_err(UiError::from)
 }
 
+/// Retry queued frames that are due. Returns how many went out.
+///
+/// Called on a timer by the webview, so a message queued while the peer was
+/// offline goes out on its own once the transport is usable again.
+#[tauri::command(rename_all = "snake_case")]
+pub fn drain_send_queue(state: State<'_, AppState>) -> UiResult<usize> {
+    state.backend()?.drain_send_queue().map_err(UiError::from)
+}
+
+/// Frames still waiting to go out for one conversation.
+#[tauri::command(rename_all = "snake_case")]
+pub fn queued_messages(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> UiResult<Vec<anon_ipc::QueuedMessageView>> {
+    state
+        .backend()?
+        .queued_messages(&conversation_id)
+        .map_err(UiError::from)
+}
+
 #[tauri::command]
 pub fn list_personas(
     state: State<'_, AppState>,
@@ -610,7 +631,11 @@ pub fn assess_strength(state: State<'_, AppState>, candidate: String) -> UiResul
     Ok(StrengthView {
         meets_minimum_length: assessment.meets_minimum_length,
         entropy_bits: assessment.estimated_entropy_bits,
+        is_well_known_weak: assessment.is_well_known_weak,
+        is_repeated_pattern: assessment.is_repeated_pattern,
         warnings: assessment.warnings,
+        // The same call the vault makes when it creates the database, so the hint
+        // and the enforcement cannot disagree.
         acceptable: vault.is_acceptable(&candidate),
     })
 }
@@ -769,6 +794,8 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         note_escrow_exported,
         export_escrow,
         transport_view,
+        drain_send_queue,
+        queued_messages,
         privacy_view,
         enable_restricted_discovery,
         export_invite,

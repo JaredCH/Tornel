@@ -1,0 +1,109 @@
+# cargo-audit configuration.
+#
+# # Why this file exists
+#
+# `cargo audit` fails the build on any advisory it finds. Every advisory below is
+# in a *transitive* dependency that this project does not control, and none has a
+# fix that can be applied from here. Without this file the security gate is red on
+# every commit, which trains everyone to ignore it — the opposite of what the gate
+# is for.
+#
+# # The rule for adding an entry
+#
+# An ignore is only acceptable when all three hold:
+#
+#   1. The crate is not one we chose; it arrives through a dependency we need
+#      (Arti for Tor, OpenMLS for the group ratchet, GTK for the window).
+#   2. No upgrade path exists from this workspace — verified with
+#      `cargo update -p <crate> --dry-run`, not assumed.
+#   3. The exposure is understood and written down here, including what would
+#      make it exploitable.
+#
+# An entry that no longer applies should be deleted, not left to rot. Each one
+# names the upstream issue to watch.
+
+[advisories]
+# Vulnerabilities always fail the build. Unmaintained/unsound advisories are
+# reported as warnings and do not fail it; they are listed at the bottom of this
+# file so the decision is visible rather than silent.
+#
+# `ignore` is a list of advisory ids. The justification for every entry is
+# written out below — an id must never be added here without one.
+ignore = [
+    "RUSTSEC-2026-0387",
+    "RUSTSEC-2026-0330",
+    "RUSTSEC-2026-0331",
+    "RUSTSEC-2023-0071",
+]
+
+# ---------------------------------------------------------------------------
+# Justifications for the entries above
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# RUSTSEC-2026-0387 — crypto-bigint: timing variability in constant-time ops
+# ---------------------------------------------------------------------------
+# Path: anon-app -> anon-mls -> openmls_rust_crypto -> hpke-rs-rust-crypto
+#       -> k256/p256/p384 -> elliptic-curve -> crypto-bigint 0.5.5
+#
+# No fix available from here: crypto-bigint 0.7.6 is the fixed version, but
+# elliptic-curve 0.13 (the only version the RustCrypto ECC crates in OpenMLS's
+# tree accept) depends on 0.5.x. `cargo update -p elliptic-curve --dry-run`
+# reports no newer compatible version.
+#
+# Exposure: the advisory concerns timing variability in big-integer operations
+# used by ECC. This app uses those curves for MLS credential signatures and HPKE,
+# not for long-term identity keys (those are Ed25519/X25519). A timing attack
+# would require an attacker to measure our operation timings, which over Tor is
+# not a practical channel. Tracked upstream in the RustCrypto elliptic-curves
+# repository; remove this entry when OpenMLS moves to elliptic-curve 0.14+.
+# "RUSTSEC-2026-0387" = "crypto-bigint 0.5.5 pinned by elliptic-curve 0.13 via OpenMLS; no compatible upgrade"
+
+# ---------------------------------------------------------------------------
+# RUSTSEC-2026-0330 / RUSTSEC-2026-0331 — libcrux-kem: panics on short input
+# ---------------------------------------------------------------------------
+# Path: anon-app -> anon-mls -> openmls -> openmls_test -> openmls_rust_crypto
+#       -> hpke-rs -> hpke-rs-libcrux -> libcrux-kem 0.0.9
+#
+# Both are reachable only through `openmls_test`, which is a *test* dependency of
+# the `openmls` crate. `cargo tree -p anon-app -e normal` does not contain
+# libcrux-kem, so it is not in the shipped binary.
+#
+# No fix available from here: hpke-rs-libcrux 0.7.0 pins `libcrux-kem = "=0.0.9"`
+# exactly, so 0.0.10 cannot be selected without an upstream release.
+#
+# Exposure: none in shipped code. Remove these when hpke-rs-libcrux allows
+# libcrux-kem 0.0.10.
+# "RUSTSEC-2026-0330" = "libcrux-kem is a dev-only path (openmls_test); pinned by hpke-rs-libcrux 0.7.0"
+# "RUSTSEC-2026-0331" = "libcrux-kem is a dev-only path (openmls_test); pinned by hpke-rs-libcrux 0.7.0"
+
+# ---------------------------------------------------------------------------
+# RUSTSEC-2023-0071 — rsa: Marvin attack (timing key recovery)
+# ---------------------------------------------------------------------------
+# Path: anon-app -> anon-transport -> arti-client -> tor-llcrypto -> rsa 0.9.10
+#
+# No fix exists: the advisory has no patched release, and Arti requires `rsa` for
+# Tor's RSA-1024 identity keys, which the Tor protocol still mandates.
+#
+# Exposure: the Marvin attack recovers an RSA *private* key by timing
+# decryption. Tor uses RSA only for identity-key signatures and for verifying
+# directory-document signatures — it does not perform RSA decryption with a
+# secret key on our behalf. The one private-key construction in the tree
+# (`tor-key-forge`, for generating onion-service keys) builds a key from bytes
+# and does not expose a decryption oracle to a remote party. This is the same
+# position the Tor Project itself is in; the advisory is unfixed upstream.
+# "RUSTSEC-2023-0071" = "rsa has no patched release; Arti needs it for Tor RSA identity keys, no remote decryption oracle"
+
+# ---------------------------------------------------------------------------
+# Warnings below do not fail the build. They are listed so the decision is
+# visible rather than silent.
+# ---------------------------------------------------------------------------
+# Unmaintained (no known vulnerability, no replacement available from here):
+#   RUSTSEC-2025-0141  bincode            (via typed-index-collections, Arti)
+#   RUSTSEC-2024-0436  paste              (via Arti crates)
+#   RUSTSEC-2024-0370  proc-macro-error   (via glib-macros/gtk3-macros, Tauri)
+#   RUSTSEC-2026-0173  proc-macro-error2  (via hax-lib-macros, libcrux)
+#   RUSTSEC-2026-0371  zbus_names         (via keyring -> secret-service, Linux)
+#   RUSTSEC-2026-0370  zvariant           (via keyring -> secret-service, Linux)
+#   RUSTSEC-2026-0372  zvariant_derive    (via keyring -> secret-service, Linux)
+# Unsound:
+#   RUSTSEC-2024-0429  glib               (via Tauri's GTK stack, Linux only)

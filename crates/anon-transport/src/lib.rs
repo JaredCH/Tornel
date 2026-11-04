@@ -231,6 +231,12 @@ impl AnonymityTransport for OfflineTransport {
     fn shutdown(&self) {}
 }
 
+/// The callback a transport invokes for each complete inbound payload.
+///
+/// Named rather than written inline so the `MockTransport` field stays readable
+/// and clippy's `type_complexity` lint does not fire on it.
+pub type InboundHandler = std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>;
+
 /// A deterministic in-process transport for exercising the messaging stack.
 ///
 /// With `tor_like = true` it advertises [`AnonymityClass::TorOnion`] and behaves
@@ -239,11 +245,13 @@ impl AnonymityTransport for OfflineTransport {
 /// exercises the anonymity gate.
 pub struct MockTransport {
     tor_like: bool,
-    ready: bool,
+    /// Atomic so a test can bring the transport up *after* a frame was queued,
+    /// which is the scenario the send queue exists for.
+    ready: std::sync::atomic::AtomicBool,
     local: Option<OnionId>,
     /// Payloads observed, in order. Test-only introspection.
     delivered: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
-    inbound_handler: std::sync::Mutex<Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>>>,
+    inbound_handler: std::sync::Mutex<Option<InboundHandler>>,
 }
 
 impl MockTransport {
@@ -251,7 +259,7 @@ impl MockTransport {
     pub fn tor_like(onion: OnionId) -> Self {
         Self {
             tor_like: true,
-            ready: true,
+            ready: std::sync::atomic::AtomicBool::new(true),
             local: Some(onion),
             delivered: std::sync::Mutex::new(Vec::new()),
             inbound_handler: std::sync::Mutex::new(None),
@@ -262,7 +270,7 @@ impl MockTransport {
     pub fn loopback() -> Self {
         Self {
             tor_like: false,
-            ready: true,
+            ready: std::sync::atomic::AtomicBool::new(true),
             local: None,
             delivered: std::sync::Mutex::new(Vec::new()),
             inbound_handler: std::sync::Mutex::new(None),
@@ -273,11 +281,20 @@ impl MockTransport {
     pub fn not_ready(onion: OnionId) -> Self {
         Self {
             tor_like: true,
-            ready: false,
+            ready: std::sync::atomic::AtomicBool::new(false),
             local: Some(onion),
             delivered: std::sync::Mutex::new(Vec::new()),
             inbound_handler: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Bring the transport up (or take it down) after construction.
+    ///
+    /// Exists so a test can queue a frame while the transport is bootstrapping and
+    /// then drain it once the transport is ready — the exact sequence the send
+    /// queue is built for.
+    pub fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Simulate an inbound payload arriving on the hosted onion service.
@@ -321,7 +338,7 @@ impl AnonymityTransport for MockTransport {
     }
 
     fn status(&self) -> TransportStatus {
-        if self.ready {
+        if self.ready.load(std::sync::atomic::Ordering::SeqCst) {
             TransportStatus::Ready
         } else {
             TransportStatus::Bootstrapping
@@ -333,7 +350,7 @@ impl AnonymityTransport for MockTransport {
     }
 
     fn is_onion_service_reachable(&self) -> bool {
-        self.ready && self.local.is_some()
+        self.ready.load(std::sync::atomic::Ordering::SeqCst) && self.local.is_some()
     }
 
     fn set_inbound_handler(&self, handler: std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>) {

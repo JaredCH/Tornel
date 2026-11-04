@@ -81,8 +81,93 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
+      # `.cargo/audit.toml` carries the ignore list. Every entry there is a
+      # transitive dependency with no available fix, and each one is justified in
+      # the file. The gate still fails on any *new* advisory, which is the point:
+      # an ignore list that is never re-examined is worse than no gate at all.
       - name: Security audit
         run: cargo audit
+
+  # Linux build. The app is developed on Windows, so without this job a
+  # platform-specific break (a Windows-only path, a missing system library, a
+  # Tauri bundle target that only exists on one OS) would ship unnoticed.
+  #
+  # The system packages are the ones Tauri v2 needs on Debian/Ubuntu: WebKitGTK
+  # 4.1 for the webview, GTK 3 for the window, and the AppImage tooling for the
+  # portable bundle. `libssl-dev` and `perl` are for the vendored OpenSSL that
+  # SQLCipher compiles.
+  linux:
+    name: build and test (linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            perl \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libfuse2 \
+            file
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+      # The no-clearnet invariant is platform-independent, but running it here too
+      # means a Linux-only contributor gets the same gate as CI on Windows.
+      - name: No-clearnet guard
+        shell: pwsh
+        run: ./scripts/check-no-clearnet.ps1
+
+      # Produce the actual installable artifacts (.deb and .AppImage) so a broken
+      # bundle config fails here rather than at release time.
+      #
+      # `tauri build` (not `tauri bundle`) is what compiles the app and then
+      # packages it; `bundle` alone expects an already-built binary and would
+      # silently package a stale one. It must run from the crate directory so the
+      # CLI finds `tauri.conf.json`.
+      - name: Bundle (deb + AppImage)
+        run: npx --yes @tauri-apps/cli@^2 build --bundles deb,appimage --ci
+        working-directory: crates/anon-app
+
+      - name: Upload Linux bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: anon-linux-bundles
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
 
   # The `check` job above uses `@stable`, so the declared `rust-version` is never
   # actually built. That is how the workspace came to declare 1.85 while its own

@@ -155,12 +155,40 @@ pub struct PassphraseAssessment {
     pub estimated_entropy_bits: u32,
     /// Human-readable warnings, empty when nothing is wrong.
     pub warnings: Vec<String>,
+    /// Whether the passphrase is on the well-known-weak deny-list.
+    ///
+    /// Exposed as a fact rather than only as warning text so a caller can apply a
+    /// stricter policy without string-matching the warning. That string match was
+    /// the bug behind "the bar is green but the vault refuses": the UI coloured
+    /// the bar from entropy alone, while the vault rejected on this flag.
+    pub is_well_known_weak: bool,
+    /// Whether the passphrase looks like a repeated or sequential pattern.
+    ///
+    /// Same reasoning as [`Self::is_well_known_weak`]: a fact, not prose.
+    pub is_repeated_pattern: bool,
 }
 
 impl PassphraseAssessment {
     /// Whether the passphrase should be presented as acceptable.
+    ///
+    /// This is the *escrow* policy: length only. The database passphrase uses a
+    /// stricter rule — see [`Self::is_acceptable_for_vault`] — because it is the
+    /// only thing protecting the message history.
     pub fn is_acceptable(&self) -> bool {
         self.meets_minimum_length
+    }
+
+    /// Whether the passphrase is acceptable for the encrypted database.
+    ///
+    /// Stricter than [`Self::is_acceptable`]: the minimum length **and** not a
+    /// known-weak or patterned string. A long-but-obvious passphrase is refused
+    /// here even though the escrow flow would warn and proceed.
+    ///
+    /// This lives on the assessment so the UI and the vault cannot disagree about
+    /// the policy — the disagreement is what produced a green bar over a rejected
+    /// passphrase.
+    pub fn is_acceptable_for_vault(&self) -> bool {
+        self.meets_minimum_length && !self.is_well_known_weak && !self.is_repeated_pattern
     }
 }
 
@@ -189,11 +217,13 @@ pub fn assess_passphrase(passphrase: &str) -> PassphraseAssessment {
         warnings.push("Uses only digits; this is very weak.".to_string());
     }
 
-    if is_common_passphrase(passphrase) {
+    let well_known_weak = is_common_passphrase(passphrase);
+    if well_known_weak {
         warnings.push("This is a well-known weak passphrase.".to_string());
     }
 
-    if is_repeated_pattern(passphrase) {
+    let repeated = is_repeated_pattern(passphrase);
+    if repeated {
         warnings.push("Looks like a repeated or sequential pattern.".to_string());
     }
 
@@ -207,6 +237,8 @@ pub fn assess_passphrase(passphrase: &str) -> PassphraseAssessment {
         meets_minimum_length: chars >= MIN_PASSPHRASE_CHARS as u32,
         estimated_entropy_bits: estimated,
         warnings,
+        is_well_known_weak: well_known_weak,
+        is_repeated_pattern: repeated,
     }
 }
 

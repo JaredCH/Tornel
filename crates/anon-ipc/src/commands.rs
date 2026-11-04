@@ -18,7 +18,7 @@
 use crate::dto::{
     AddMemberOutcome, ConsentPrompt, ConsentSubmission, ConversationView, DeliveryState,
     GroupMemberView, GroupView, IdentityView, MessageView, PeerView, ProposalView,
-    RemoveMemberOutcome, SendRequest, TransportView,
+    QueuedMessageView, RemoveMemberOutcome, SendRequest, TransportView,
 };
 use crate::error::{CommandError, IpcError, Result};
 use crate::SecretHandle;
@@ -355,7 +355,44 @@ impl Backend {
             blocked_reason,
             local_onion_short: t.local_onion().map(|o| o.short_label()),
             local_onion: t.local_onion().map(|o| o.as_str().to_string()),
+            queued_count: self.messaging.queued_count().unwrap_or(0),
         }
+    }
+
+    /// Retry every queued frame that is due.
+    ///
+    /// Called on a timer by the shell. Returns how many frames went out, so the UI
+    /// can refresh a conversation only when something actually changed.
+    pub fn drain_send_queue(&self) -> std::result::Result<usize, CommandError> {
+        let report = self
+            .messaging
+            .drain_queue(self.store.now())
+            .map_err(CommandError::from)?;
+        Ok(report.sent)
+    }
+
+    /// Queued frames for one conversation, oldest first.
+    ///
+    /// Exposed so the UI can show a message as "queued" rather than pretending it
+    /// was delivered (`plan.md` §8).
+    pub fn queued_messages(
+        &self,
+        conversation_id: &str,
+    ) -> std::result::Result<Vec<QueuedMessageView>, CommandError> {
+        let (conv, _) = conversation_id_bytes(conversation_id)?;
+        let queued = self
+            .messaging
+            .queued_for(&conv)
+            .map_err(CommandError::from)?;
+        Ok(queued
+            .into_iter()
+            .map(|q| QueuedMessageView {
+                id: hex_encode(&q.id),
+                created_at: q.created_at,
+                attempts: q.attempts,
+                last_error: q.last_error,
+            })
+            .collect())
     }
 
     // -- Sending -----------------------------------------------------------
@@ -1282,7 +1319,12 @@ impl Backend {
         }
         let body = anon_messaging::attachment::sanitize_body(request.body.as_bytes())?;
 
-        if !self.messaging.can_send() {
+        // A transport that is merely *not ready yet* (bootstrapping, or the peer's
+        // onion service not published) is a delay, not a failure: the frame is
+        // queued and retried. A transport that can never carry the frame — no Tor
+        // backend compiled in — is a real refusal, because queueing it would only
+        // promise a delivery that cannot happen.
+        if !self.messaging.can_send() && !self.messaging.can_queue() {
             let reason = self
                 .messaging
                 .send_unavailable_reason()
@@ -1309,9 +1351,20 @@ impl Backend {
         let envelope = encode_direct_envelope(&self.identity, &conv, request.epoch, now, &body);
 
         let route = PeerRoute::onion(onion);
+        // `send_or_queue` keeps the sealed frame on this device when the peer is
+        // unreachable, so an offline recipient is a delay rather than a loss. The
+        // message is recorded locally either way, so the sender's own history is
+        // complete even while the frame is still queued.
         let report = self
             .messaging
-            .send(&route, conv, request.epoch, &key, &envelope)
+            .send_or_queue(
+                &route,
+                conv,
+                request.epoch,
+                &key,
+                &envelope,
+                self.store.expiry_for(now),
+            )
             .map_err(CommandError::from)?;
 
         let self_code = self.contact_code().map_err(CommandError::from)?;

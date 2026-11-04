@@ -1,0 +1,202 @@
+name: release
+
+# Publishes installable packages for every OS the app targets.
+#
+# Triggered by a version tag (`v0.1.0`) or manually. A manual run builds the
+# artifacts and uploads them as workflow artifacts without creating a release, so
+# the pipeline can be exercised before a tag exists.
+#
+# The Windows and Linux jobs are independent: a Linux-only break must not block a
+# Windows package, and vice versa. The `publish` job only runs when both succeed,
+# so a release never contains a partial set of platforms.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: "Create the GitHub release as a draft"
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Windows: NSIS installer (.exe)
+  # ---------------------------------------------------------------------------
+  windows:
+    name: windows (nsis)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      # SQLCipher is built with vendored OpenSSL, which needs Perl. The runner
+      # usually ships Strawberry Perl; this makes a missing one an explicit,
+      # early failure rather than a confusing openssl-sys error.
+      - name: Verify build prerequisites
+        shell: pwsh
+        run: |
+          $perl = Get-Command perl -ErrorAction SilentlyContinue
+          if (-not $perl) {
+            Write-Host "Perl is not installed; installing Strawberry Perl." -ForegroundColor Yellow
+            choco install strawberryperl -y --no-progress
+            $env:PATH = "C:\Strawberry\perl\bin;C:\Strawberry\c\bin;$env:PATH"
+            "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+            "C:\Strawberry\c\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+          perl --version
+
+      # The shipped build must have the Tor backend: without it the app refuses to
+      # send at all. Building the release without `--features tor` would produce an
+      # installer that cannot do the one thing it exists for.
+      - name: Build and bundle (NSIS)
+        run: npx --yes @tauri-apps/cli@^2 build --features tor --bundles nsis --ci
+        working-directory: crates/anon-app
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: anon-windows
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux: .deb and .AppImage
+  # ---------------------------------------------------------------------------
+  linux:
+    name: linux (deb + appimage)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            perl \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libfuse2 \
+            file
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build and bundle (deb + AppImage)
+        run: npx --yes @tauri-apps/cli@^2 build --features tor --bundles deb,appimage --ci
+        working-directory: crates/anon-app
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: anon-linux
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Publish: attach every platform's artifacts to one GitHub release
+  # ---------------------------------------------------------------------------
+  publish:
+    name: publish release
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    # A manual run without a tag only produces artifacts, never a release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist
+
+      # Checksums let a user verify a download without trusting the transport.
+      # The app's whole premise is that the network is hostile, so shipping an
+      # unverifiable binary would be inconsistent with that.
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          generate_release_notes: true
+          files: |
+            dist/*.exe
+            dist/*.deb
+            dist/*.AppImage
+            dist/SHA256SUMS.txt
+          body: |
+            Tornel `anon` ${{ github.ref_name }}
+
+            Serverless, 100% Tor v3 onion peer-to-peer messenger.
+
+            ## Packages
+
+            | Platform | File |
+            | --- | --- |
+            | Windows (x64) | `anon_*_x64-setup.exe` (NSIS) |
+            | Debian / Ubuntu (x64) | `anon_*_amd64.deb` |
+            | Any Linux (x64) | `anon_*_amd64.AppImage` |
+
+            Verify a download against `SHA256SUMS.txt` before running it.
+
+            ## What this build does and does not do
+
+            These packages are built with `--features tor`, so the embedded Arti
+            transport is present and the app can reach the Tor network. A build
+            without that feature refuses to send at all — that is the fail-closed
+            default, not a bug.
+
+            The app still cannot send until Tor bootstraps and its own v3 onion
+            service publishes (typically 20–60s after launch). Messages composed
+            before then are queued on your device and retried automatically.
+
+            ## Linux notes
+
+            The `.deb` declares `libwebkit2gtk-4.1-0` and `libgtk-3-0`. The
+            AppImage needs FUSE 2 (`libfuse2`) to run; on distributions that ship
+            only FUSE 3, run it with `--appimage-extract-and-run`.

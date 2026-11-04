@@ -39,6 +39,7 @@ pub mod error;
 pub mod mailbox;
 pub mod rekey;
 pub mod schema;
+pub mod send_queue;
 pub mod store;
 
 pub use bucket::{BucketId, DataKey, KeyRing};
@@ -46,6 +47,7 @@ pub use error::{Result, StorageError};
 pub use mailbox::{BufferedBlob, Mailbox, MailboxPolicy, MailboxReceipt, MailboxRejection};
 pub use rekey::{rekey, resume, RekeyMarker, RekeyPaths, RekeyReport, RekeyStage};
 pub use schema::{RETENTION_DAYS, SCHEMA_VERSION};
+pub use send_queue::{QueuedSend, SendQueue};
 pub use store::{
     Argon2Params, ContactRow, ConversationKind, ConversationRow, GroupRow, MessageRow, PurgeReport,
     Store, StoreConfig,
