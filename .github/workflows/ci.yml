@@ -195,8 +195,13 @@ jobs:
         with:
           targets: aarch64-linux-android
 
+      # `setup-android` defaults to `packages: 'tools platform-tools'`, but the legacy
+      # `tools` package no longer exists in cmdline-tools 16.0 — the action fails with
+      # "Failed to find package 'tools'" before any Rust code is compiled.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools"
 
       - name: Install NDK
         run: sdkmanager --install "ndk;27.0.12077973"

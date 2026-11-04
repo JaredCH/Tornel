@@ -172,6 +172,22 @@ jobs:
       - name: Install NDK
         run: sdkmanager --install "ndk;27.0.12077973"
 
+      # The vendored OpenSSL that SQLCipher compiles invokes the NDK's `ranlib` by its
+      # target-prefixed name (`aarch64-linux-android-ranlib`), which the NDK does not
+      # provide — it ships `llvm-ranlib` and per-API clang wrappers only. Without this
+      # the build fails at `make install_dev` with "aarch64-linux-android-ranlib: not
+      # found". Symlinking the LLVM tools under the prefixed names is the documented
+      # workaround and is what `cargo-ndk` does internally for the compiler.
+      - name: Expose NDK tools under target-prefixed names
+        run: |
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "$NDK_BIN" >> "$GITHUB_PATH"
+          for target in aarch64-linux-android armv7a-linux-androideabi i686-linux-android x86_64-linux-android; do
+            ln -sf "$NDK_BIN/llvm-ranlib" "$NDK_BIN/${target}-ranlib"
+            ln -sf "$NDK_BIN/llvm-ar" "$NDK_BIN/${target}-ar"
+          done
+          ls -l "$NDK_BIN" | grep -E 'ranlib|llvm-ar' | head -20
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:

@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "anon-app"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "android-native-keyring-store",
  "anon-consent",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "anon-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anon-consent",
  "anon-core",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "anon-consent"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anon-core",
  "anon-messaging",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "anon-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "argon2",
  "bech32",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "anon-ipc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anon-consent",
  "anon-core",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "anon-messaging"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anon-core",
  "anon-mls",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "anon-mls"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anon-core",
  "anon-storage",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "anon-storage"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anon-core",
  "argon2",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "anon-transport"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anon-core",
  "arti-client",
