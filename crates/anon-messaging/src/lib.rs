@@ -18,6 +18,7 @@
 //! Keeping framing separate from the ratchet is what lets the group protocol be
 //! swapped (`§3.4`) without redesigning the wire format.
 
+pub mod attachment;
 pub mod deliver;
 pub mod error;
 pub mod frame;

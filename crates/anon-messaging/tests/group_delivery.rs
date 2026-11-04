@@ -167,6 +167,80 @@ fn the_wire_payload_is_padded_to_a_bucket() {
 }
 
 #[test]
+fn low_level_send_apis_cannot_bypass_attachment_sanitization() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let (
+        alice_dev,
+        _bob_dev,
+        mut alice_group,
+        mut bob_group,
+        mut alice_msg,
+        mut bob_msg,
+        transport,
+    ) = setup();
+    let direct_store = Store::open(
+        &alice_dev.dir.join("direct.db"),
+        "test-passphrase-1234",
+        StoreConfig {
+            params: Argon2Params::test_fast(),
+            purge_on_open: false,
+            vacuum_after_purge: false,
+        },
+    )
+    .unwrap();
+    let direct = anon_messaging::MessagingService::new(transport.clone(), Arc::new(direct_store));
+    let invalid = b"ANON_ATTACHMENT_V1:{\"dataUrl\":\"data:image/png;base64,JVBERi0xLjc=\"}";
+    assert!(matches!(
+        alice_msg.send(&mut alice_group, &route("bob"), CONVERSATION, invalid),
+        Err(MessageError::UnsafeAttachment(_))
+    ));
+    assert!(matches!(
+        direct.send(&route("bob"), CONVERSATION, 0, &[3; 32], invalid),
+        Err(MessageError::UnsafeAttachment(_))
+    ));
+    assert!(transport.take_delivered().is_empty());
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+        .encode_image(&image::RgbImage::new(64, 48))
+        .unwrap();
+    let body = format!(
+        "ANON_ATTACHMENT_V1:{}",
+        serde_json::json!({
+            "name": "private-camera.jpg",
+            "dataUrl": format!("data:image/jpeg;base64,{}", STANDARD.encode(jpeg))
+        })
+    );
+    alice_msg
+        .send(
+            &mut alice_group,
+            &route("bob"),
+            CONVERSATION,
+            body.as_bytes(),
+        )
+        .unwrap();
+    direct
+        .send(&route("bob"), CONVERSATION, 0, &[3; 32], body.as_bytes())
+        .unwrap();
+    let delivered = transport.take_delivered();
+    assert_eq!(delivered.len(), 2);
+    let group_frame = Frame::decode(&delivered[0].1).unwrap();
+    let group_body = bob_msg
+        .receive(&mut bob_group, &group_frame, CONVERSATION)
+        .unwrap();
+    let direct_body = Frame::decode(&delivered[1].1)
+        .unwrap()
+        .open(&[3; 32])
+        .unwrap();
+    for clean in [group_body, direct_body] {
+        let value: serde_json::Value =
+            serde_json::from_slice(&clean[anon_messaging::attachment::ATTACHMENT_PREFIX.len()..])
+                .unwrap();
+        assert_eq!(value["name"], "image.jpg");
+        assert_ne!(clean, body.as_bytes());
+    }
+}
+
+#[test]
 fn a_removed_member_cannot_read_group_messages_end_to_end() {
     // The §7.1 Phase 4 exit criterion, at the composition level: MLS refuses,
     // and that refusal survives being wrapped in a frame and sent over a

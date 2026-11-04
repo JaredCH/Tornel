@@ -107,6 +107,9 @@ impl From<IpcError> for CommandError {
         // Map to a code without echoing internals. The message is the human
         // explanation; the code is what the frontend switches on.
         let code = match &e {
+            IpcError::Messaging(anon_messaging::MessageError::UnsafeAttachment(_)) => {
+                "unsafe_attachment"
+            }
             IpcError::EmptyField(_) | IpcError::FieldTooLong(_) => "invalid_input",
             IpcError::BadContactCode(_) | IpcError::BadOnion(_) => "invalid_address",
             IpcError::BadGroupId(_) => "invalid_group_id",

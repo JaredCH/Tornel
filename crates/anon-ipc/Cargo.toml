@@ -33,3 +33,6 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 hex.workspace = true
+base64 = "0.22.1"
+image = { version = "0.25.9", default-features = false, features = ["jpeg", "png"] }
+serde_json = "1.0"

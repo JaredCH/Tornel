@@ -961,6 +961,7 @@ impl Backend {
         if body.len() > MAX_BODY {
             return Err(CommandError::from(IpcError::FieldTooLong("body")));
         }
+        let body = anon_messaging::attachment::sanitize_body(body.as_bytes())?;
 
         let group_bytes = decode_group_id(group_id)?;
         self.store
@@ -976,7 +977,7 @@ impl Backend {
         let info = group.info();
         let now = self.store.now();
         let self_code = self.contact_code().map_err(CommandError::from)?;
-        let env = encode_group_envelope(now, &self_code, body.as_bytes());
+        let env = encode_group_envelope(now, &self_code, &body);
 
         // Encrypt with OpenMLS (advances the sender's ratcheting generation for this epoch).
         let mls_ct = group.encrypt(&provider, &env).map_err(CommandError::from)?;
@@ -992,7 +993,7 @@ impl Backend {
                 anon_storage::ConversationKind::Group,
                 self_code.as_bytes(),
                 now,
-                body.as_bytes(),
+                &body,
             )
             .map_err(CommandError::from)?;
 
@@ -1274,6 +1275,7 @@ impl Backend {
         if request.body.len() > MAX_BODY {
             return Err(CommandError::from(IpcError::FieldTooLong("body")));
         }
+        let body = anon_messaging::attachment::sanitize_body(request.body.as_bytes())?;
 
         if !self.messaging.can_send() {
             let reason = self
@@ -1299,13 +1301,7 @@ impl Backend {
         let key = derive_direct_key(&self.identity, &peer_pub, &conv, request.epoch);
 
         let now = self.store.now();
-        let envelope = encode_direct_envelope(
-            &self.identity,
-            &conv,
-            request.epoch,
-            now,
-            request.body.as_bytes(),
-        );
+        let envelope = encode_direct_envelope(&self.identity, &conv, request.epoch, now, &body);
 
         let route = PeerRoute::onion(onion);
         let report = self
@@ -1315,7 +1311,7 @@ impl Backend {
 
         let self_code = self.contact_code().map_err(CommandError::from)?;
         self.store
-            .insert_message(&conv, self_code.as_bytes(), now, request.body.as_bytes())
+            .insert_message(&conv, self_code.as_bytes(), now, &body)
             .map_err(CommandError::from)?;
 
         Ok(map_outcome(report.outcome))
@@ -1719,6 +1715,47 @@ mod tests {
     use super::*;
     use anon_storage::{Argon2Params, Store, StoreConfig};
     use anon_transport::MockTransport;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    fn image_attachment() -> String {
+        let image = image::RgbImage::from_pixel(64, 48, image::Rgb([40, 100, 180]));
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&image)
+            .unwrap();
+        jpeg.extend_from_slice(b"private camera serial");
+        format!(
+            "{}{}",
+            anon_messaging::attachment::ATTACHMENT_PREFIX,
+            serde_json::json!({
+                "name": "Alice-camera-serial.jpg", "mime": "image/jpeg", "size": jpeg.len(),
+                "dataUrl": format!("data:image/jpeg;base64,{}", STANDARD.encode(jpeg)),
+                "caption": "photo"
+            })
+        )
+    }
+
+    fn assert_clean_attachment(body: &str) {
+        let payload = body
+            .strip_prefix(anon_messaging::attachment::ATTACHMENT_PREFIX)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(value["name"], "image.jpg");
+        assert_eq!(value["caption"], "photo");
+        let bytes = STANDARD
+            .decode(
+                value["dataUrl"]
+                    .as_str()
+                    .unwrap()
+                    .split_once(',')
+                    .unwrap()
+                    .1,
+            )
+            .unwrap();
+        assert!(!bytes.windows(7).any(|part| part == b"private"));
+        let image = image::load_from_memory(&bytes).unwrap();
+        assert!(image.width() < 64 && image.height() < 48);
+    }
 
     fn test_store(tag: &str) -> Arc<Store> {
         let mut p = std::env::temp_dir();
@@ -1817,5 +1854,118 @@ mod tests {
         // Replaying the exact same frame is ignored.
         trans_b.inject_inbound(delivered[0].1.clone());
         assert_eq!(bob.messages(&conv_hex_bob).unwrap().len(), 1);
+
+        let mut request = SendRequest {
+            conversation_id: bob_code,
+            recipient_onion: onion_b.as_str().to_string(),
+            epoch: 0,
+            body: format!(
+                "{}{{\"dataUrl\":\"data:image/jpeg;base64,JVBERi0xLjc=\"}}",
+                anon_messaging::attachment::ATTACHMENT_PREFIX
+            ),
+        };
+        assert_eq!(
+            alice.send_direct(&request).unwrap_err().code,
+            "unsafe_attachment"
+        );
+        assert!(trans_a.take_delivered().is_empty());
+        assert_eq!(alice.messages(&conv_hex_bob).unwrap().len(), 1);
+
+        request.body = image_attachment();
+        alice.send_direct(&request).unwrap();
+        let delivered = trans_a.take_delivered();
+        assert_eq!(delivered.len(), 1);
+        trans_b.inject_inbound(delivered[0].1.clone());
+        let received = bob.messages(&conv_hex_bob).unwrap();
+        let sent = alice.messages(&conv_hex_bob).unwrap();
+        let received = received
+            .iter()
+            .find(|message| {
+                message
+                    .body
+                    .starts_with(anon_messaging::attachment::ATTACHMENT_PREFIX)
+            })
+            .unwrap();
+        assert_clean_attachment(&received.body);
+        assert!(sent.iter().any(|message| message.body == received.body));
+        assert_ne!(received.body, request.body);
+    }
+
+    #[test]
+    fn group_attachments_are_sanitized_before_mls_and_storage() {
+        let onion =
+            OnionId::parse("vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion")
+                .unwrap();
+        let transport = Arc::new(MockTransport::tor_like(onion.clone()));
+        let alice = Backend::new(
+            IdentityKeys::generate().unwrap(),
+            transport.clone(),
+            test_store("attachment-group-alice"),
+        );
+        let bob = Backend::new(
+            IdentityKeys::generate().unwrap(),
+            transport.clone(),
+            test_store("attachment-group-bob"),
+        );
+        alice
+            .add_peer(
+                &bob.contact_code().unwrap(),
+                Some(format!("Bob|{}", onion.as_str())),
+            )
+            .unwrap();
+        let view = alice.create_group("photos").unwrap();
+        let group_id = decode_group_id(&view.group_id).unwrap();
+        let alice_provider = alice.group_provider().unwrap();
+        let bob_provider = bob.group_provider().unwrap();
+        let mut group = Group::load(&alice_provider, &group_id).unwrap().unwrap();
+        let key_package =
+            Group::key_package(&bob_provider, bob.contact_code().unwrap().as_bytes()).unwrap();
+        let added = group.add_members(&alice_provider, &[key_package]).unwrap();
+        let mut bob_group = Group::join_from_welcome(&bob_provider, &added.welcome).unwrap();
+        let conversation = group_conversation_id(&group_id);
+        let conversation_hex = hex_encode(&conversation);
+        let epoch = group.epoch();
+        let invalid = format!(
+            "{}{{\"dataUrl\":\"data:application/pdf;base64,JVBERi0xLjc=\"}}",
+            anon_messaging::attachment::ATTACHMENT_PREFIX
+        );
+        assert_eq!(
+            alice
+                .send_group_message(&view.group_id, &invalid)
+                .unwrap_err()
+                .code,
+            "unsafe_attachment"
+        );
+        assert!(transport.take_delivered().is_empty());
+        assert!(alice.messages(&conversation_hex).unwrap().is_empty());
+        assert_eq!(
+            Group::load(&alice_provider, &group_id)
+                .unwrap()
+                .unwrap()
+                .epoch(),
+            epoch
+        );
+
+        alice
+            .send_group_message(&view.group_id, &image_attachment())
+            .unwrap();
+        let delivered = transport.take_delivered();
+        assert_eq!(delivered.len(), 1);
+        let frame = Frame::decode(&delivered[0].1).unwrap();
+        let ciphertext = frame
+            .open(&derive_group_frame_key(&group_id, &conversation, epoch))
+            .unwrap();
+        let envelope = bob_group.decrypt(&bob_provider, &ciphertext).unwrap();
+        let sent = alice.messages(&conversation_hex).unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_clean_attachment(&sent[0].body);
+        assert_eq!(
+            envelope,
+            encode_group_envelope(
+                alice.store.now(),
+                &alice.contact_code().unwrap(),
+                sent[0].body.as_bytes()
+            )
+        );
     }
 }

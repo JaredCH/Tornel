@@ -3,6 +3,9 @@ use thiserror::Error;
 /// Messaging failures.
 #[derive(Debug, Error)]
 pub enum MessageError {
+    #[error("attachment rejected: {0}")]
+    UnsafeAttachment(&'static str),
+
     #[error("frame encoding error: {0}")]
     Frame(#[from] FrameError),
 

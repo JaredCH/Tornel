@@ -1,6 +1,6 @@
 # Tornel (`anon`) — Serverless, 100% Tor v3 Onion P2P Messenger
 
-A Rust + Tauri v2 desktop and mobile communication application built around **zero application-operated servers**, **100% Tor v3 onion-service rendezvous routing** (via embedded Arti), **authenticated end-to-end encryption** (X25519 + Ed25519 for 1-on-1, RFC 9420 MLS for groups with role-based permissions), **encrypted inline image & file sharing**, and **local-only SQLCipher storage with a mandatory 90-day crypto-shredding retention ceiling**.
+A Rust + Tauri v2 desktop and mobile communication application built around **zero application-operated servers**, **100% Tor v3 onion-service rendezvous routing** (via embedded Arti), **authenticated end-to-end encryption** (X25519 + Ed25519 for 1-on-1, RFC 9420 MLS for groups with role-based permissions), **encrypted image sharing with mandatory attachment sanitization**, and **local-only SQLCipher storage with a mandatory 90-day crypto-shredding retention ceiling**.
 
 > **Security Status & Audit Notice:** Embedded Arti bootstrap, v3 onion-service descriptor publication, and authenticated two-peer 1-on-1 and MLS group message/attachment delivery over Tor rendezvous have been verified end-to-end (both standalone and alongside an active Tor Browser daemon on ports `9150`/`9151`). However, this software has not yet undergone a formal third-party cryptographic or network-anonymity audit. Review the **Mitigated vs. Remaining Risks** section below before relying on it in high-adversary environments.
 
@@ -25,6 +25,7 @@ Overstating protection in an anonymity tool is itself a hazard (`plan.md` §2.4,
 | **Disk forensics &stolen data directory backups** | **User-Held Passphrase + OS Keychain.** The SQLCipher database key is derived via Argon2id (`64 MiB`, 3 passes) from a passphrase you enter at launch—never stored on disk. The identity seed is stored in the OS Keychain (Windows Credential Manager / macOS Keychain / Linux Secret Service). |
 | **Historical data retention & SSD wear-leveling recovery** | **Mandatory 90-Day TTL + Monthly Crypto-Shredding.** Every content table (`messages`, `conversations`, `attachments`, `mailbox_buffer`, `consent_log`) enforces `STRICT` integer `expires_at` deadlines. Beyond SQL `DELETE` + `VACUUM`, row ciphertexts are encrypted under per-month HKDF bucket keys that are permanently destroyed once a month ages past 90 days, rendering surviving flash blocks undecryptable. |
 | **Compromised or removed group member reading future messages** | **RFC 9420 MLS Ratcheting + Human-in-the-Loop Consent.** Group membership changes advance the MLS epoch and derive fresh tree secrets (`openmls`), locking removed leaves out of future messages. Sensitive rotations trigger a nonce-bound, Ed25519-signed consent modal before taking effect. |
+| **Embedded attachment metadata and original filenames** | **Mandatory fail-closed sanitization before sending.** JPEG/PNG images are decoded and rebuilt as new JPEGs without source EXIF/GPS, XMP, ICC, comments, thumbnails, trailing data, or original filenames. Unsupported files are rejected, never passed through unchanged. |
 
 ### Remaining Risks & Operational Limitations
 
@@ -35,11 +36,50 @@ Overstating protection in an anonymity tool is itself a hazard (`plan.md` §2.4,
 | **Long-Lived Identity & `.onion` Linkability Across Contacts** | By default, an install uses a single persistent contact code (`anon1…`) and a single persistent v3 `.onion` service (`ONION_SERVICE_NICKNAME = "anon"`). If you share the same Invite Bundle with two different people, or post it publicly, they can prove they are talking to the same pseudonymous entity. Use separate profile directories (`ANON_DATA_DIR`) when you require unlinkable personas. |
 | **Public v3 Onion Reachability (Lack of Per-Peer Client Auth — D8)** | Standard v3 onion descriptors are encrypted on HsDirs using the public `.onion` address key. Anyone who possesses your 56-character `.onion` address can attempt to open a rendezvous stream to your service (though unauthenticated frames are dropped before touching storage). Restricted-discovery Tor client authorization (`KS_hsc_desc_enc`) is not yet wired. |
 | **Endpoint Compromise / Malware on an Unlocked Device** | SQLCipher and the OS Keychain protect data **at rest**. While the application is unlocked and running, decrypted keys and message plaintexts necessarily exist in process memory (mitigated on drop via `zeroize`, but exposed to root/user-level malware, screen capture, or memory dumps while live). |
-| **Attachment Metadata Inside Shared Files** | When you share an image or document over Tor, Tornel encrypts and pads the file in transit and at rest, but it does **not** strip internal file metadata (such as camera EXIF GPS tags, PDF author properties, or original filenames) before sending. Sanitize files before attaching if your peer is untrusted. |
+| **Visual Identification and Camera Fingerprints** | Mandatory metadata removal, cropping, resampling, mild blur and tonal changes do **not** guarantee anonymity or defeat sensor-pattern noise (PRNU), steganography, perceptual matching, or forensic device attribution. Faces, landmarks, watermarks, visible text, and captions can still identify you. This processing has not been validated against camera-attribution datasets. |
 | **Non-Repudiation (No Plausible Deniability)** | Direct messages are signed with your Ed25519 identity key (`ANM1` envelope) and group messages are signed with your MLS leaf signature key to prevent forgery and impersonation. A recipient who decrypts a message can cryptographically prove to a third party that your public key signed it (`plan.md` §9.5, §13). |
 | **Asynchronous Offline Delivery Requires Online Rendezvous** | Because there are no central servers, sending a direct or group message requires both the sender's and recipient's Tor v3 onion services to be online simultaneously (until peer-hosted mailbox sync is wired to automatic background polling). |
 
 ---
+
+## Mandatory Attachment Sanitization
+
+All application attachment sends, including direct and MLS group messages, pass
+through the Rust sanitizer before signing/encryption and before saving sent
+history. There is no opt-out or trusted-client flag. The lower-level messaging
+send APIs also sanitize attachment envelopes. Opaque encrypted transport/mailbox
+frames are not decoded or modified by relays.
+
+- Only JPEG and PNG inputs are currently supported. PDF/Office documents,
+  archives, SVG, GIF, WebP, HEIC, audio, video, and other files are **blocked**.
+  Their metadata cannot safely be removed by a generic byte scrub. Filename,
+  supplied MIME type, and supplied size are not trusted for format validation.
+- Images are decoded with bounded allocations (64 MiB decoder budget), at most
+  8 megapixels and 4096 pixels per side, and at least 16 pixels per side.
+  Raw attachments remain limited to 360 KiB; invalid or oversized input is rejected.
+- Orientation is applied to pixels before discarding source metadata. Transparent
+  pixels are composited onto white; PNG animation/layers are flattened to the
+  decoded default image. Embedded color profiles are discarded, so colors may shift.
+- Each edge loses approximately 1-2% (at least one pixel). Images are downscaled
+  to at most 1280 pixels per side without upscaling, mildly blurred, and given
+  small randomized contrast/brightness changes using OS randomness. These are
+  risk-reduction measures, not a proven fingerprint-removal algorithm.
+- A fresh RGB JPEG is encoded at quality 82, with additional downscaling when
+  necessary to fit the transfer limit. Every outgoing filename is `image.jpg`;
+  MIME type and size are derived from the new bytes. Unknown envelope properties
+  are discarded. Captions are retained as user-authored content, not anonymized.
+- Processing failures reject the send with `unsafe_attachment`, without storing
+  the original attachment in message history or transmitting it. Original files
+  on disk and previously sent/received messages are not modified. The pre-send
+  preview is local and shows the original; sent history shows the processed image.
+
+Regression coverage includes metadata/trailing-data removal, transparent pixels,
+crop and pixel changes, malformed/disguised/unsupported files, dimension and size
+limits, and direct/group encryption and persistence boundaries:
+
+```powershell
+cargo test -p anon-messaging -p anon-ipc
+```
 
 ## Architecture
 

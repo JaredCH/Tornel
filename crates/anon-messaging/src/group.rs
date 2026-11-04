@@ -89,8 +89,9 @@ impl GroupMessaging {
         conversation: [u8; 16],
         plaintext: &[u8],
     ) -> Result<DeliveryReport> {
+        let plaintext = crate::attachment::sanitize_body(plaintext)?;
         let ciphertext = group
-            .encrypt(&self.provider, plaintext)
+            .encrypt(&self.provider, &plaintext)
             .map_err(|e| MessageError::Group(e.to_string()))?;
 
         // The frame key is derived from the group's current epoch state rather

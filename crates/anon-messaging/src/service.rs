@@ -74,7 +74,8 @@ impl MessagingService {
         key: &[u8; 32],
         plaintext: &[u8],
     ) -> Result<DeliveryReport> {
-        let frame = Frame::seal(key, conversation, epoch, plaintext)?;
+        let plaintext = crate::attachment::sanitize_body(plaintext)?;
+        let frame = Frame::seal(key, conversation, epoch, &plaintext)?;
         send_frame(self.transport.as_ref(), route, &self.outbox, &frame)
     }
 
