@@ -470,12 +470,20 @@ Prerequisites are the Android SDK with NDK 27, JDK 21, and the four Android Rust
 targets (`rustup target add aarch64-linux-android armv7-linux-androideabi
 i686-linux-android x86_64-linux-android`).
 
-Two Android-specific notes:
+Four Android-specific notes:
 
 * **Build on Linux or macOS, not Windows.** SQLCipher compiles a vendored OpenSSL,
   and its `Configure` script requires a Perl that emits Unix paths. Strawberry Perl
   on Windows does not, and the build fails with "This perl implementation doesn't
   produce Unix like paths". The `android` CI job runs on Linux for this reason.
+* **The NDK's `ranlib` must be reachable under a target-prefixed name.** The vendored
+  OpenSSL build invokes `aarch64-linux-android-ranlib`, which the NDK does not ship —
+  it provides `llvm-ranlib` only. Symlink the LLVM tools under the prefixed names (the
+  release workflow does this) or the build fails at `make install_dev`.
+* **`crates/anon-app/package.json` is required.** The generated Gradle project's build
+  task shells out to `npm run -- tauri android android-studio-script`, so a
+  `package.json` with a `tauri` script must exist in the crate directory. Without it
+  Gradle fails with `ENOENT: no such file or directory, open '.../package.json'`.
 * **The identity seed uses the Android Keystore.** `keyring`'s `v1` facade covers
   macOS, Windows and `*nix` but deliberately not Android, so the Android build
   installs `android-native-keyring-store` (Keystore + SharedPreferences) into

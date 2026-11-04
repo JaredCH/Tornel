@@ -1,0 +1,12 @@
+{
+  "name": "anon-app",
+  "private": true,
+  "version": "0.1.3",
+  "description": "Build shim for the Tauri Android Gradle project.",
+  "scripts": {
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
