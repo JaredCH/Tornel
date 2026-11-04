@@ -48,7 +48,7 @@
               id="setup-passphrase"
               type="password"
               autocomplete="new-password"
-              placeholder="Vault passphrase (16+ characters)"
+              placeholder="Vault passphrase (12+ characters)"
               spellcheck="false"
             />
           </div>
@@ -123,6 +123,18 @@
             <button id="interrupted-submit" class="primary-full">Finish Migration</button>
           </div>
           <p id="interrupted-result" class="hint small"></p>
+        </div>
+
+        <!-- Blocked: startup found a problem the app cannot work around -->
+        <div id="launch-blocked" hidden>
+          <h2>Cannot start</h2>
+          <p class="hint">
+            The app opened so it could tell you this, rather than exiting silently.
+          </p>
+          <p id="blocked-reason" class="hint small error" role="alert"></p>
+          <p class="hint small">
+            Nothing was written to disk. Fix the problem above and relaunch.
+          </p>
         </div>
       </div>
     </div>

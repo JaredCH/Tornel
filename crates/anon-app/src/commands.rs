@@ -57,6 +57,13 @@ pub struct AppState {
     vault: Arc<Vault>,
     /// The data directory, for the identity store.
     data_dir: std::path::PathBuf,
+    /// Why the app cannot proceed, when startup found a fatal problem.
+    ///
+    /// Set instead of aborting the launch. The window still opens and the launch screen
+    /// explains the failure, because a process that exits before drawing anything is
+    /// indistinguishable from one that crashed — which is exactly how an unavailable
+    /// Linux credential store was reported.
+    blocked_reason: Option<String>,
 }
 
 impl AppState {
@@ -67,7 +74,25 @@ impl AppState {
             unlock_lock: Mutex::new(()),
             vault: Arc::new(vault),
             data_dir,
+            blocked_reason: None,
         }
+    }
+
+    /// Build a state that cannot proceed, carrying the reason for the launch screen.
+    ///
+    /// Used when startup finds a fatal problem that is not the user's fault and not
+    /// fixable from inside the app — an unavailable credential store, most often. The
+    /// app still opens so the reason is visible.
+    pub fn blocked(vault: Vault, data_dir: std::path::PathBuf, reason: String) -> Self {
+        Self {
+            blocked_reason: Some(reason),
+            ..Self::locked(vault, data_dir)
+        }
+    }
+
+    /// Why the app cannot proceed, if it cannot.
+    pub fn blocked_reason(&self) -> Option<&str> {
+        self.blocked_reason.as_deref()
     }
 
     /// Install a backend after a successful unlock or setup.
@@ -602,6 +627,18 @@ pub fn vault_view(state: State<'_, AppState>) -> UiResult<VaultView> {
     let vault = state.vault();
     let vault_state = vault.state();
 
+    // A blocked launch outranks the vault state: there is no point offering a passphrase
+    // screen when the identity seed cannot be read or stored.
+    if let Some(reason) = state.blocked_reason() {
+        return Ok(VaultView {
+            state: "blocked".to_string(),
+            is_setup: false,
+            min_chars: crate::vault::MIN_CHARS,
+            migration_stage: None,
+            blocked_reason: Some(reason.to_string()),
+        });
+    }
+
     Ok(VaultView {
         state: match &vault_state {
             VaultState::FreshInstall => "fresh_install",
@@ -616,6 +653,7 @@ pub fn vault_view(state: State<'_, AppState>) -> UiResult<VaultView> {
             VaultState::InterruptedMigration { stage } => Some(stage),
             _ => None,
         },
+        blocked_reason: None,
     })
 }
 
@@ -822,6 +860,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
 
 #[cfg(test)]
 mod tests {
+    use super::{AppState, Vault};
     use anon_ipc::DeliveryState;
 
     #[test]
@@ -831,5 +870,34 @@ mod tests {
         assert_eq!(DeliveryState::AtMailbox.code(), "at_mailbox");
         assert_eq!(DeliveryState::Delivered.code(), "delivered");
         assert_eq!(DeliveryState::Read.code(), "read");
+    }
+
+    #[test]
+    fn a_blocked_state_reports_its_reason_and_offers_no_passphrase_screen() {
+        // Regression test for the "it never launched" report: an unavailable credential
+        // store used to abort the process before a window existed. The state must now
+        // carry the reason so the launch screen can show it.
+        let dir = std::env::temp_dir().join(format!(
+            "anon-blocked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vault = Vault::new(&dir, anon_storage::Argon2Params::mobile_default());
+
+        let state = AppState::blocked(vault, dir.clone(), "no credential store".to_string());
+        assert_eq!(state.blocked_reason(), Some("no credential store"));
+        assert!(!state.is_unlocked(), "a blocked app is never unlocked");
+
+        // A normal locked state must not report a reason, or every launch would look
+        // blocked.
+        let vault = Vault::new(&dir, anon_storage::Argon2Params::mobile_default());
+        let state = AppState::locked(vault, dir.clone());
+        assert_eq!(state.blocked_reason(), None);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

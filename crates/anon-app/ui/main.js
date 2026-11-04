@@ -106,6 +106,7 @@ const launch = {
   setup: () => $("launch-setup"),
   unlock: () => $("launch-unlock"),
   interrupted: () => $("launch-interrupted"),
+  blocked: () => $("launch-blocked"),
 };
 
 /** Hide every launch sub-screen. */
@@ -113,6 +114,7 @@ function hideLaunchScreens() {
   launch.setup().hidden = true;
   launch.unlock().hidden = true;
   launch.interrupted().hidden = true;
+  launch.blocked().hidden = true;
 }
 
 /**
@@ -125,6 +127,14 @@ function renderLaunch(view) {
   launch.root().hidden = false;
   $("app").hidden = true;
   hideLaunchScreens();
+
+  // A blocked launch has no useful action to offer, so it is checked first: showing a
+  // passphrase screen would invite the user to type a passphrase that cannot be used.
+  if (view.state === "blocked") {
+    launch.blocked().hidden = false;
+    $("blocked-reason").textContent = view.blocked_reason ?? "startup failed";
+    return;
+  }
 
   if (view.state === "interrupted_migration") {
     launch.interrupted().hidden = false;
@@ -150,6 +160,12 @@ function renderLaunch(view) {
       $("setup-explain").textContent =
         "This passphrase protects your message history on this device. It is never " +
         "stored, so you will enter it on every launch.";
+    }
+    // Take the minimum from Rust rather than hardcoding it. The placeholder used to say
+    // "16+ characters" while the policy enforced 12, so the screen contradicted the rule
+    // it was describing.
+    if (view.min_chars) {
+      $("setup-passphrase").placeholder = `Vault passphrase (${view.min_chars}+ characters)`;
     }
     $("setup-passphrase").focus();
     return;

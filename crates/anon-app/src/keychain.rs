@@ -109,7 +109,45 @@ pub trait KeychainBackend {
     fn delete(&self) -> Result<(), KeychainError>;
 }
 
-/// Thereal OS keychain, via `keyring`'s `v1` facade.
+/// The entry type for the platform's credential store.
+///
+/// On desktop this is `keyring`'s `v1` facade, which picks Keychain / Credential Manager /
+/// Secret Service itself. On Android the facade has no store at all — its
+/// `set_credential_store` returns `Invalid("platform")` — so the Keystore-backed store is
+/// installed explicitly and `keyring-core`'s entry type is used directly. Both expose the
+/// same four methods and the same error type, which is why one alias is enough.
+#[cfg(not(target_os = "android"))]
+type PlatformEntry = keyring::Entry;
+
+#[cfg(target_os = "android")]
+type PlatformEntry = keyring_core::Entry;
+
+/// Install the Android credential store, once per process.
+///
+/// `keyring-core` requires the store to be set before any entry is created, and setting it
+/// twice would replace the first. `OnceLock` makes the second call a no-op that reports the
+/// first call's answer.
+///
+/// The store needs the NDK application context, which `tao` initialises when it creates the
+/// window. That is why this is called lazily from [`KeychainBackend::available`] rather than
+/// from a static initialiser: at static-init time the context does not exist yet.
+#[cfg(target_os = "android")]
+fn android_store_ready() -> bool {
+    use std::sync::OnceLock;
+    static READY: OnceLock<bool> = OnceLock::new();
+    *READY.get_or_init(|| match android_native_keyring_store::Store::new() {
+        Ok(store) => {
+            keyring_core::set_default_store(store);
+            true
+        }
+        Err(error) => {
+            eprintln!("anon: the Android credential store could not be initialised: {error}");
+            false
+        }
+    })
+}
+
+/// The real OS keychain, via `keyring`'s `v1` facade (or the Android store).
 pub struct OsKeychain {
     account: String,
 }
@@ -150,11 +188,18 @@ impl OsKeychain {
     }
 
     /// Build an entry, mapping a store-initialisation failure to [`KeychainError`].
-    fn entry(&self) -> Result<keyring::Entry, KeychainError> {
-        keyring::Entry::new(SERVICE, &self.account).map_err(|e| match e {
+    fn entry(&self) -> Result<PlatformEntry, KeychainError> {
+        #[cfg(target_os = "android")]
+        if !android_store_ready() {
+            return Err(KeychainError::Unavailable(
+                "the Android Keystore store could not be initialised".to_string(),
+            ));
+        }
+
+        PlatformEntry::new(SERVICE, &self.account).map_err(|e| match e {
             // `NoDefaultStore` is the documented signal that the platform credential
             // store could not be initialised (see `keyring::v1::Entry::new`).
-            keyring::Error::NoDefaultStore => {
+            keyring_core::Error::NoDefaultStore => {
                 KeychainError::Unavailable("no platform credential store".to_string())
             }
             other => KeychainError::Operation(other.to_string()),
@@ -170,15 +215,23 @@ impl Default for OsKeychain {
 
 impl KeychainBackend for OsKeychain {
     fn available(&self) -> bool {
-        // `store_status()` initialises the store on first call and reports whether it
-        // worked, which is exactly the question being asked.
-        keyring::Entry::store_status().is_ok()
+        // On desktop, `store_status()` initialises the store on first call and reports
+        // whether it worked, which is exactly the question being asked. On Android there
+        // is no facade to ask, so the store is installed here and its outcome reported.
+        #[cfg(not(target_os = "android"))]
+        {
+            keyring::Entry::store_status().is_ok()
+        }
+        #[cfg(target_os = "android")]
+        {
+            android_store_ready()
+        }
     }
 
     fn store(&self, seed: &[u8; SEED_LEN]) -> Result<(), KeychainError> {
         let entry = self.entry()?;
         entry.set_secret(seed).map_err(|e| match e {
-            keyring::Error::NoDefaultStore => {
+            keyring_core::Error::NoDefaultStore => {
                 KeychainError::Unavailable("no platform credential store".to_string())
             }
             other => KeychainError::Operation(other.to_string()),
@@ -190,8 +243,8 @@ impl KeychainBackend for OsKeychain {
         match entry.get_secret() {
             Ok(bytes) => decode_seed(&bytes).map(Some),
             // The one variant that means "nothing is stored" rather than "it broke".
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(keyring::Error::NoDefaultStore) => Err(KeychainError::Unavailable(
+            Err(keyring_core::Error::NoEntry) => Ok(None),
+            Err(keyring_core::Error::NoDefaultStore) => Err(KeychainError::Unavailable(
                 "no platform credential store".to_string(),
             )),
             Err(other) => Err(KeychainError::Operation(other.to_string())),
@@ -202,7 +255,7 @@ impl KeychainBackend for OsKeychain {
         let entry = self.entry()?;
         match entry.delete_credential() {
             // Deleting what is not there is the desired end state, so it is not an error.
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(other) => Err(KeychainError::Operation(other.to_string())),
         }
     }

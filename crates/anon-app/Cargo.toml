@@ -53,6 +53,17 @@ getrandom.workspace = true
 # automatically. Deliberately NOT the `cli` feature: its own docs say it "saddles an
 # application with a lot of dependent modules it won't need".
 keyring = { version = "4.2.0", features = ["v1"] }
+# `keyring`'s `v1` facade covers macOS, Windows and *nix but deliberately not Android
+# (its `set_credential_store` returns `Invalid("platform")` there). Linking `keyring-core`
+# directly lets the Android build install the Keystore-backed store itself; on desktop the
+# facade installs the platform store and this is only used for its error type, which is the
+# same type `keyring` re-exports.
+keyring-core = "1.0.1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Android Keystore + SharedPreferences credential store for `keyring-core`. Requires the
+# NDK application context, which `tao` initialises when the window is created.
+android-native-keyring-store = "1.0.0"
 
 [features]
 default = []

@@ -554,7 +554,10 @@ mod tests {
             "this candidate is meant to score well on entropy, got {}",
             assessment.estimated_entropy_bits
         );
-        assert!(assessment.is_well_known_weak);
+        // It is refused as a repeated pattern rather than as a deny-list entry: the list
+        // matches whole strings, and "passwordpassword" is not one of them. What matters
+        // for this test is that it is refused at all, so the bar cannot be green.
+        assert!(assessment.is_repeated_pattern);
         assert!(!assessment.is_acceptable_for_vault());
         assert!(!v.is_acceptable("passwordpassword"));
     }

@@ -285,8 +285,19 @@ fn is_common_passphrase(s: &str) -> bool {
         "dragon",
         "abc123",
     ];
+    // Exact match, not substring.
+    //
+    // This used to be `lower.contains(c)`, which rejected any passphrase that merely
+    // *contained* a listed word. That made the policy far stricter than it looked: a
+    // long, high-entropy passphrase like "my-dragon-photograph-42" was refused outright
+    // because it contains "dragon", and the user was told it was "well-known weak" when
+    // it is nothing of the sort. A deny-list entry is a whole passphrase someone might
+    // actually type, so comparing the whole string is the correct test.
+    //
+    // The length floor and the pattern check still catch the cases this list exists for;
+    // this only stops the list from rejecting good passphrases by accident.
     let lower = s.to_lowercase();
-    COMMON.iter().any(|c| lower == *c || lower.contains(c))
+    COMMON.iter().any(|c| lower == *c)
 }
 
 fn is_repeated_pattern(s: &str) -> bool {
@@ -310,7 +321,10 @@ fn is_repeated_pattern(s: &str) -> bool {
         }
     }
 
-    // Monotonic runs (e.g. "abcdefghij", "9876543210").
+    // Monotonic runs covering the whole string (e.g. "abcdefghij", "9876543210").
+    // `windows(2).all(..)` already requires every adjacent pair to be consecutive, so a
+    // passphrase that merely contains a run is not caught here — only one that is nothing
+    // but a run.
     let ascending = chars.windows(2).all(|w| w[1] as u32 == w[0] as u32 + 1);
     let descending = chars.windows(2).all(|w| w[0] as u32 == w[1] as u32 + 1);
     ascending || descending
@@ -625,8 +639,15 @@ mod tests {
         assert!(!weak.is_acceptable());
         assert!(!weak.warnings.is_empty());
 
-        let common = assess_passphrase("passwordpassword");
+        // An exact deny-list entry is flagged as well-known. `passwordpassword` is not
+        // (the list matches whole strings), but it is still refused — as a repeated
+        // pattern, which is what it actually is.
+        let common = assess_passphrase("password");
         assert!(common.warnings.iter().any(|w| w.contains("well-known")));
+
+        let doubled = assess_passphrase("passwordpassword");
+        assert!(doubled.warnings.iter().any(|w| w.contains("pattern")));
+        assert!(!doubled.is_acceptable_for_vault());
 
         let repeated = assess_passphrase("ababababababab");
         assert!(repeated.warnings.iter().any(|w| w.contains("pattern")));
@@ -641,6 +662,54 @@ mod tests {
         assert!(strong.meets_minimum_length);
         assert!(strong.is_acceptable());
         assert!(strong.estimated_entropy_bits >= 60);
+    }
+
+    #[test]
+    fn a_good_passphrase_containing_a_listed_word_is_accepted() {
+        // Regression test for an over-strict policy: the deny-list used to match on
+        // substring, so any passphrase containing "dragon", "admin", "monkey" and friends
+        // was refused as "well-known weak" no matter how long or random it was. These are
+        // all long, high-entropy passphrases that merely happen to contain a listed word.
+        for candidate in [
+            "my-dragon-photograph-42",
+            "administering-quixotic-feldspar",
+            "monkeywrench-trombone-velocity",
+            "trustno1-but-actually-a-long-phrase",
+        ] {
+            let assessment = assess_passphrase(candidate);
+            assert!(
+                !assessment.is_well_known_weak,
+                "`{candidate}` must not be flagged as a well-known weak passphrase"
+            );
+            assert!(
+                assessment.is_acceptable_for_vault(),
+                "`{candidate}` must be acceptable for the vault"
+            );
+        }
+    }
+
+    #[test]
+    fn the_deny_list_still_rejects_the_exact_weak_strings() {
+        // The relaxation above must not weaken the case the list exists for.
+        for candidate in ["password", "passphrase", "letmein", "monkey", "dragon"] {
+            assert!(
+                assess_passphrase(candidate).is_well_known_weak,
+                "`{candidate}` is exactly a listed weak passphrase and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_passphrase_that_merely_contains_a_run_is_accepted() {
+        // The pattern check requires the run to span the whole string, so a passphrase
+        // that ends in a short sequence is fine. This pins that, because tightening the
+        // check to "contains a run" would reject most real passphrases.
+        let assessment = assess_passphrase("correct-horse-abc");
+        assert!(
+            !assessment.is_repeated_pattern,
+            "a passphrase containing a run must not be treated as a repeated pattern"
+        );
+        assert!(assessment.is_acceptable_for_vault());
     }
 
     #[test]

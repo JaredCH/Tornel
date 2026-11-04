@@ -47,6 +47,7 @@ pub mod commands;
 pub mod identity_store;
 pub mod keychain;
 pub mod personas;
+pub mod startup;
 pub mod vault;
 
 use anon_storage::{Argon2Params, Store};
@@ -64,6 +65,21 @@ use tauri::Manager;
 /// How often the retention purge runs (`plan.md` §6.4: on launch and every 24h).
 const PURGE_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
+/// The Android entry point.
+///
+/// Tauri's mobile targets do not have a `main`: the Android activity loads the library and
+/// calls this. It must exist for the Android build to link, and it is the same [`run`] the
+/// desktop binary uses, so there is one startup path rather than two.
+///
+/// `tauri::mobile_entry_point` generates the JNI symbol the Java side looks up. It is
+/// gated to mobile targets because on desktop the symbol would be dead code.
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run_mobile() {
+    if let Err(error) = run() {
+        eprintln!("anon: failed to start: {error}");
+    }
+}
+
 /// Build and run the application.
 ///
 /// Returns the Tauri error type so `main.rs` can report a startup failure rather
@@ -73,6 +89,11 @@ pub fn run() -> tauri::Result<()> {
     // `RUST_LOG` asks for them. Silent by default. See `anon_transport::logging`: without
     // this, a stuck Tor bootstrap produces an empty log and looks like a silent hang.
     anon_transport::init_tracing();
+
+    // A Linux launch that opens no window is the hardest failure to diagnose, because the
+    // process exits without a message. These fallbacks are the documented WebKitGTK
+    // switches for the two common causes; see the function's own docs.
+    apply_linux_webview_fallbacks();
 
     // When `ANON_DATA_DIR` is set for running multiple instances side by side, also point
     // WebView2 (`WEBVIEW2_USER_DATA_FOLDER`) into a subdirectory of that profile if not
@@ -86,7 +107,7 @@ pub fn run() -> tauri::Result<()> {
         }
     }
 
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .setup(|app| {
             let state = build_state(app.handle())?;
             if let Ok(title) = std::env::var("ANON_WINDOW_TITLE") {
@@ -100,8 +121,45 @@ pub fn run() -> tauri::Result<()> {
             Ok(())
         })
         .pipe(commands::register)
-        .run(tauri::generate_context!())
+        .run(tauri::generate_context!());
+
+    // A GUI launch has no terminal, so a failure before the window opens would otherwise
+    // leave no trace at all. Record it where the user can find it.
+    if let Err(error) = &result {
+        if let Some(path) = startup::record_failure(error) {
+            eprintln!("anon: startup details written to {}", path.display());
+        }
+    }
+    result
 }
+
+/// Disable WebKitGTK's DMA-BUF renderer, which leaves a blank window on some systems.
+///
+/// On drivers and virtual machines without working GBM support, WebKitGTK's DMA-BUF
+/// renderer fails with "Failed to get GBM device" and the window never paints. The
+/// documented workaround is `WEBKIT_DISABLE_DMABUF_RENDERER=1`, which falls back to the
+/// shared-memory path.
+///
+/// # Why this is set by default
+///
+/// The failure mode is a window that opens and stays blank, which a user cannot diagnose
+/// and cannot work around without knowing the variable exists. The cost of the fallback is
+/// a slower paint path on hardware that would have worked; the cost of not setting it is an
+/// unusable app on hardware that would not. A user who wants the faster path back sets the
+/// variable to `0`, and an explicit value is never overridden.
+///
+/// Deliberately *not* included: `WEBKIT_DISABLE_COMPOSITING_MODE`. It also fixes blank
+/// windows, but it disables accelerated compositing for every user rather than only the
+/// broken path, so it stays a documented manual fallback instead of a default.
+#[cfg(target_os = "linux")]
+fn apply_linux_webview_fallbacks() {
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_linux_webview_fallbacks() {}
 
 /// Build the application state.
 ///
@@ -116,30 +174,40 @@ pub fn run() -> tauri::Result<()> {
 /// using a machine-held secret, which meant the app started without a login and the
 /// at-rest encryption was decorative. See [`vault`] for the full reasoning.
 ///
-/// # What is still fatal here
+/// # The keychain check blocks, it does not abort
 ///
-/// The keychain check. An unavailable keychain means the identity seed cannot be read or
-/// stored safely, and the app must not start in a mode that would write a plaintext seed.
-/// That check runs before the window opens so the failure is reported rather than
-/// discovered later.
+/// An unavailable keychain means the identity seed cannot be read or stored safely, and
+/// the app must not start in a mode that would write a plaintext seed. That rule is
+/// unchanged. What changed is the *reporting*: the state is marked blocked and the launch
+/// screen explains why, instead of the process exiting before a window exists. A GUI
+/// launch has no terminal, so an early exit is indistinguishable from a crash — which is
+/// how an unavailable Linux Secret Service was reported.
 fn build_state(handle: &tauri::AppHandle) -> Result<AppState, Box<dyn std::error::Error>> {
     let data_dir = app_data_dir(handle)?;
     std::fs::create_dir_all(&data_dir)?;
 
+    // The vault owns the passphrase policy and the database path. It holds no secret.
+    let vault = vault::Vault::new(&data_dir, Argon2Params::mobile_default());
+
     // The keychain must be usable before anything else. Checking here rather than at
     // unlock time means a broken keychain is reported at launch, not after the user has
     // typed a passphrase and expected to get in.
+    //
+    // The failure is *reported*, not fatal to the process. Returning an error here would
+    // abort before the window opens, and a GUI launch has no terminal — so the user sees
+    // the app start and vanish with no explanation. That is precisely how an unavailable
+    // Linux Secret Service was reported. The app still refuses to write a plaintext seed;
+    // it just says so on screen.
     let keychain = keychain::OsKeychain::new();
     if !keychain.available() {
-        return Err(
-            "the OS keychain is unavailable; refusing to start rather than \
-                    fall back to a plaintext seed file"
-                .into(),
-        );
+        let reason = "The OS credential store is unavailable, so the identity seed cannot \
+                      be read or stored safely. The app will not fall back to a plaintext \
+                      seed file. On Linux this usually means no Secret Service provider is \
+                      running: install and start gnome-keyring or KWallet, then relaunch."
+            .to_string();
+        eprintln!("anon: {reason}");
+        return Ok(AppState::blocked(vault, data_dir, reason));
     }
-
-    // The vault owns the passphrase policy and the database path. It holds no secret.
-    let vault = vault::Vault::new(&data_dir, Argon2Params::mobile_default());
 
     // A rekey interrupted by a crash must be finished before the app can open the
     // database. The vault reports that state so the launch screen can say where it

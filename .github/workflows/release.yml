@@ -129,14 +129,100 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # Android: signed APK (and AAB for Play)
+  # ---------------------------------------------------------------------------
+  #
+  # Android is built on Linux rather than Windows because the vendored OpenSSL that
+  # SQLCipher compiles needs a Unix-like Perl. On Windows the build fails with
+  # "This perl implementation doesn't produce Unix like paths", which is a toolchain
+  # limitation rather than a code problem.
+  android:
+    name: android (apk)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev perl file
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: sdkmanager --install "ndk;27.0.12077973"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-android-${{ hashFiles('**/Cargo.lock') }}
+
+      # The Android project is generated, not committed (see .gitignore), so it must be
+      # created before the build. `android init` is idempotent and fails if the project
+      # already exists, which is why it is guarded.
+      - name: Generate Android project
+        run: |
+          if [ ! -d gen/android ]; then
+            npx --yes @tauri-apps/cli@^2 android init --ci
+          fi
+        working-directory: crates/anon-app
+
+      # The generated Gradle project has no release signing config, so this produces an
+      # *unsigned* release APK. That is deliberate rather than an oversight: signing needs
+      # a keystore, and a keystore is a long-lived secret that must not be invented by CI.
+      # To ship a signed build, add a `signingConfigs.release` block to
+      # `gen/android/app/build.gradle.kts` (see the Tauri Android signing guide) and supply
+      # the keystore through repository secrets. Until then the artifact is installable
+      # only after `apksigner` signs it, which the README says.
+      - name: Build APK
+        run: npx --yes @tauri-apps/cli@^2 android build --apk --ci
+        working-directory: crates/anon-app
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: anon-android
+          path: |
+            target/release/apk/*.apk
+            crates/anon-app/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
   # Publish: attach every platform's artifacts to one GitHub release
   # ---------------------------------------------------------------------------
   publish:
     name: publish release
-    needs: [windows, linux]
+    needs: [windows, linux, android]
     runs-on: ubuntu-latest
     # A manual run without a tag only produces artifacts, never a release.
-    if: startsWith(github.ref, 'refs/tags/v')
+    #
+    # Windows and Linux must both succeed: a release that silently omits a platform
+    # users already have installed is worse than no release. Android is deliberately
+    # *not* required — it is the newest target and the one most likely to break on a
+    # toolchain change (NDK, Gradle, the vendored OpenSSL build), and it must not be
+    # able to block the desktop packages. A green Android build is still included,
+    # because the artifact download below picks up whatever the run produced.
+    if: >-
+      startsWith(github.ref, 'refs/tags/v')
+      && needs.windows.result == 'success'
+      && needs.linux.result == 'success'
     steps:
       - uses: actions/checkout@v4
 
@@ -153,7 +239,7 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p out
-          find dist -type f \( -name '*.exe' -o -name '*.deb' -o -name '*.AppImage' \) \
+          find dist -type f \( -name '*.exe' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.apk' \) \
             -exec cp {} out/ \;
           ls -la out
 
@@ -176,6 +262,7 @@ jobs:
             out/*.exe
             out/*.deb
             out/*.AppImage
+            out/*.apk
             out/SHA256SUMS.txt
           body: |
             Tornel `anon` ${{ github.ref_name }}
@@ -189,6 +276,7 @@ jobs:
             | Windows (x64) | `anon_*_x64-setup.exe` (NSIS) |
             | Debian / Ubuntu (x64) | `anon_*_amd64.deb` |
             | Any Linux (x64) | `anon_*_amd64.AppImage` |
+            | Android (arm64 + x86_64) | `anon_*_universal.apk` |
 
             Verify a download against `SHA256SUMS.txt` before running it.
 

@@ -169,6 +169,55 @@ jobs:
             target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
 
+  # Android build. The app targets Android as well as desktop, and the Android path has
+  # its own failure modes that no desktop job can catch: `keyring`'s `v1` facade has no
+  # Android store at all, the credential store needs the NDK application context, and the
+  # vendored OpenSSL that SQLCipher compiles needs a Unix-like Perl (which is why this runs
+  # on Linux rather than Windows).
+  #
+  # Only `cargo check` runs here. A full APK build needs the Android SDK, an emulator or
+  # device, and a signing key; the release workflow does that. What this job guarantees is
+  # that the Android-only code paths still compile.
+  android:
+    name: build (android)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev perl file
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: sdkmanager --install "ndk;27.0.12077973"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-android-${{ hashFiles('**/Cargo.lock') }}
+
+      # `cargo ndk` sets the linker and the CC/AR variables the vendored OpenSSL build
+      # needs, which a bare `cargo check --target` does not.
+      - name: Check (Android)
+        run: cargo ndk -t arm64-v8a check -p anon-app
+
   # The `check` job above uses `@stable`, so the declared `rust-version` is never
   # actually built. That is how the workspace came to declare 1.85 while its own
   # dependency tree required 1.92: nothing ever compiled the declared minimum, so the

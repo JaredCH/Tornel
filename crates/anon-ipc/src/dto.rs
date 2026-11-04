@@ -378,8 +378,8 @@ pub struct RemoveMemberOutcome {
 /// argument, and is never returned.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VaultView {
-    /// Which screen to show: `fresh_install`, `needs_migration`, `locked`, or
-    /// `interrupted_migration`.
+    /// Which screen to show: `fresh_install`, `needs_migration`, `locked`,
+    /// `interrupted_migration`, or `blocked`.
     pub state: String,
     /// Whether the user is choosing a passphrase (`true`) or entering an existing one
     /// (`false`).
@@ -391,6 +391,14 @@ pub struct VaultView {
     /// A display string, not a number: the UI shows it verbatim so a stuck migration
     /// reports where it stopped rather than "please wait".
     pub migration_stage: Option<String>,
+    /// Why the app cannot proceed, when `state` is `blocked`.
+    ///
+    /// A launch can fail before any screen is useful — most often because the OS
+    /// credential store is unavailable, which is fatal by design (the seed must never
+    /// fall back to a plaintext file). Reporting it here rather than exiting means the
+    /// window still opens and the user is told what to fix, instead of watching the
+    /// process disappear with no message.
+    pub blocked_reason: Option<String>,
 }
 
 /// A passphrase strength report for the setup screen (gap-closure plan Gap 2).

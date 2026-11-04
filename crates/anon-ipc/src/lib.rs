@@ -169,6 +169,7 @@ pub fn dto_inventory() -> Vec<&'static str> {
         "is_setup",
         "min_chars",
         "migration_stage",
+        "blocked_reason",
         // StrengthView
         "meets_minimum_length",
         "entropy_bits",

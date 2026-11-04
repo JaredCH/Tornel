@@ -417,11 +417,82 @@ Artifacts land in `target/release/bundle/deb/` and
 `target/release/bundle/appimage/`. The `linux` CI job builds and uploads both, so
 a Linux-only break fails a pull request rather than a release.
 
+#### If the AppImage asks for a password, or opens no window
+
+Two separate problems produce the same report — "it asked for my password and then
+never started".
+
+**The password prompt is not the app.** An AppImage is a self-mounting archive: the
+runtime mounts its payload through FUSE before any of our code runs. On a system
+without FUSE 2 the runtime cannot mount, and some desktop environments respond by
+offering to install `libfuse2` through polkit — that is the password dialog. If the
+install is declined or fails, the process exits before `anon` starts, so nothing
+appears. Either install FUSE 2 once:
+
+```bash
+sudo apt-get install libfuse2
+```
+
+or run the AppImage without FUSE at all, which needs no privileges:
+
+```bash
+./anon_*_amd64.AppImage --appimage-extract-and-run
+```
+
+The `.deb` avoids this entirely, because it installs normally and needs no FUSE.
+
+**A window that never paints** is a WebKitGTK rendering failure, not a mount
+failure — usually "Failed to get GBM device" on a driver or virtual machine without
+working DMA-BUF support. The app sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` by default
+to fall back to the shared-memory path. To keep the faster path on hardware that
+works, set it to `0` before launching. If the window is still blank, also try
+`WEBKIT_DISABLE_COMPOSITING_MODE=1`; that one is not set by default because it
+disables accelerated compositing for everyone.
+
+**If it still exits silently**, the reason is written to `startup.log` in the app
+data directory (`~/.local/share/com.jaredch.tornel/`). A launch that fails before
+the window opens — most often because no Secret Service provider is running — now
+opens the window and explains itself instead of exiting, but the log is the
+fallback when even that cannot happen.
+
+### Android
+
+The app builds for Android as well as desktop. The Android project is generated
+rather than committed, so the first build creates it:
+
+```bash
+cd crates/anon-app
+npx --yes @tauri-apps/cli@^2 android init
+npx --yes @tauri-apps/cli@^2 android build --apk
+```
+
+Prerequisites are the Android SDK with NDK 27, JDK 21, and the four Android Rust
+targets (`rustup target add aarch64-linux-android armv7-linux-androideabi
+i686-linux-android x86_64-linux-android`).
+
+Two Android-specific notes:
+
+* **Build on Linux or macOS, not Windows.** SQLCipher compiles a vendored OpenSSL,
+  and its `Configure` script requires a Perl that emits Unix paths. Strawberry Perl
+  on Windows does not, and the build fails with "This perl implementation doesn't
+  produce Unix like paths". The `android` CI job runs on Linux for this reason.
+* **The identity seed uses the Android Keystore.** `keyring`'s `v1` facade covers
+  macOS, Windows and `*nix` but deliberately not Android, so the Android build
+  installs `android-native-keyring-store` (Keystore + SharedPreferences) into
+  `keyring-core` itself. The seed is still never written to a plaintext file, and an
+  unavailable Keystore still blocks the app rather than degrading.
+
+The release workflow produces an **unsigned** APK, because the generated Gradle
+project has no release signing config and a keystore is a long-lived secret that CI
+must not invent. To distribute it, add a `signingConfigs.release` block to
+`gen/android/app/build.gradle.kts` and supply the keystore through repository
+secrets; until then, sign the artifact yourself with `apksigner` before installing.
+
 ### Releasing
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds the NSIS
-installer on Windows and the `.deb`/`.AppImage` on Linux — both with
-`--features tor` — and publishes one GitHub release with a `SHA256SUMS.txt`:
+installer on Windows, the `.deb`/`.AppImage` on Linux, and the Android APK — all
+with `--features tor` — and publishes one GitHub release with a `SHA256SUMS.txt`:
 
 ```bash
 git tag v0.1.0
@@ -595,6 +666,27 @@ There is also **no recovery**. If you forget the passphrase, the message history
 unreadable — that is what makes it protection rather than a formality. Your *identity*
 is separate: it lives in the OS keychain and can be restored from an escrow artifact,
 so a forgotten database passphrase costs you history, not your contact code.
+
+#### What the passphrase policy actually requires
+
+The rule is **12 characters**, plus two rejections: the passphrase must not be exactly
+a well-known weak string (`password`, `letmein`, `monkey`, …), and it must not be a
+repeated or sequential pattern (`abcabcabcabc`, `abcdefghijkl`). Everything else is
+accepted, and the strength bar is advisory — it warns, it does not gate.
+
+Two earlier behaviours were stricter than that and have been removed, because they
+refused good passphrases:
+
+* The deny-list matched on **substring**, so any passphrase *containing* a listed word
+  was refused as "well-known weak" — `my-dragon-photograph-42` was rejected outright.
+  It now matches the whole string only.
+* The setup screen's placeholder said **"16+ characters"** while the policy enforced 12,
+  so the screen contradicted the rule it was describing. The placeholder now reads the
+  minimum from Rust.
+
+The pattern check was already correct: it requires the run to span the whole passphrase,
+so `correct-horse-abc` is fine. That is now pinned by a test so it cannot be tightened
+into rejecting real passphrases.
 
 The migration needs free space for a full second copy of the database, because it
 copies rather than rewriting in place. That is deliberate: an in-place `PRAGMA rekey`
