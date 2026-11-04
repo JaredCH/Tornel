@@ -364,6 +364,13 @@ winget install StrawberryPerl.StrawberryPerl
 
 Without Perl the build fails with `openssl-sys: Command 'perl' not found`.
 
+If Perl is installed but not on `PATH` (the winget package does not add it), point
+the build at it for the session:
+
+```powershell
+$env:PATH = "C:\Strawberry\perl\bin;C:\Strawberry\c\bin;$env:PATH"
+```
+
 ### Linux prerequisite (Debian / Ubuntu)
 
 The same vendored-OpenSSL build applies, so `perl` and `libssl-dev` are required.
@@ -409,6 +416,28 @@ npx --yes @tauri-apps/cli@^2 bundle --bundles deb,appimage
 Artifacts land in `target/release/bundle/deb/` and
 `target/release/bundle/appimage/`. The `linux` CI job builds and uploads both, so
 a Linux-only break fails a pull request rather than a release.
+
+### Releasing
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds the NSIS
+installer on Windows and the `.deb`/`.AppImage` on Linux — both with
+`--features tor` — and publishes one GitHub release with a `SHA256SUMS.txt`:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+A manual `workflow_dispatch` run builds the same artifacts without creating a
+release, so the pipeline can be exercised before a tag exists.
+
+### Dependency advisories
+
+`cargo audit` runs in CI and fails on any advisory not listed in
+[`.cargo/audit.toml`](./.cargo/audit.toml). Every entry there is a transitive
+dependency with no available fix, and each one records why it is tolerated and
+what would make it exploitable. The gate still fails on any *new* advisory — an
+ignore list that is never re-examined is worse than no gate at all.
 
 ---
 

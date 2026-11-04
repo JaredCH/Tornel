@@ -81,6 +81,10 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
+      # `.cargo/audit.toml` carries the ignore list. Every entry there is a
+      # transitive dependency with no available fix, and each one is justified in
+      # the file. The gate still fails on any *new* advisory, which is the point:
+      # an ignore list that is never re-examined is worse than no gate at all.
       - name: Security audit
         run: cargo audit
 
