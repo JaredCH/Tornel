@@ -175,6 +175,7 @@ pub fn dto_inventory() -> Vec<&'static str> {
         "entropy_bits",
         "is_well_known_weak",
         "is_repeated_pattern",
+        "is_obviously_weak_pattern",
         "warnings",
         "acceptable",
     ]

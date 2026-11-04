@@ -165,7 +165,24 @@ pub struct PassphraseAssessment {
     /// Whether the passphrase looks like a repeated or sequential pattern.
     ///
     /// Same reasoning as [`Self::is_well_known_weak`]: a fact, not prose.
+    ///
+    /// This is deliberately broad — repetition is worth *warning* about even when it
+    /// is harmless. It is **not** the hard-rejection test; see
+    /// [`Self::is_obviously_weak_pattern`].
     pub is_repeated_pattern: bool,
+    /// Whether the repetition is degenerate enough to refuse outright.
+    ///
+    /// [`Self::is_repeated_pattern`] flags anything that repeats or runs monotonically,
+    /// because that is worth warning about. Refusing on that same broad test was too
+    /// strict in practice: a long unit repeated twice (`Tromso2024Tromso2024`) carries
+    /// real entropy per unit and is not a guess an attacker starts with, yet it was
+    /// rejected outright with "looks like a repeated pattern".
+    ///
+    /// This narrows the hard rejection to repetition that genuinely adds nothing: a
+    /// single repeated character, a short unit repeated to fill the string, a monotonic
+    /// run, or a deny-listed word repeated. A long unit repeated twice is warned about
+    /// but accepted.
+    pub is_obviously_weak_pattern: bool,
 }
 
 impl PassphraseAssessment {
@@ -181,14 +198,18 @@ impl PassphraseAssessment {
     /// Whether the passphrase is acceptable for the encrypted database.
     ///
     /// Stricter than [`Self::is_acceptable`]: the minimum length **and** not a
-    /// known-weak or patterned string. A long-but-obvious passphrase is refused
-    /// here even though the escrow flow would warn and proceed.
+    /// known-weak or obviously-patterned string. A long-but-obvious passphrase is
+    /// refused here even though the escrow flow would warn and proceed.
+    ///
+    /// The pattern test used here is [`Self::is_obviously_weak_pattern`], not the
+    /// broader [`Self::is_repeated_pattern`]. The broad flag is a warning; using it as
+    /// the gate refused long passphrases that merely repeat a substantial unit twice.
     ///
     /// This lives on the assessment so the UI and the vault cannot disagree about
     /// the policy — the disagreement is what produced a green bar over a rejected
     /// passphrase.
     pub fn is_acceptable_for_vault(&self) -> bool {
-        self.meets_minimum_length && !self.is_well_known_weak && !self.is_repeated_pattern
+        self.meets_minimum_length && !self.is_well_known_weak && !self.is_obviously_weak_pattern
     }
 }
 
@@ -227,6 +248,12 @@ pub fn assess_passphrase(passphrase: &str) -> PassphraseAssessment {
         warnings.push("Looks like a repeated or sequential pattern.".to_string());
     }
 
+    // The hard-rejection test is narrower than the warning above. See
+    // `is_obviously_weak_pattern` for why: a long unit repeated twice is worth a
+    // warning but is not a guess an attacker starts with, so refusing it outright
+    // rejected real passphrases.
+    let obviously_weak = is_obviously_weak_pattern(passphrase);
+
     if estimated < 60 {
         warnings.push(
             "Estimated strength is low for protecting a long-lived identity key.".to_string(),
@@ -239,6 +266,7 @@ pub fn assess_passphrase(passphrase: &str) -> PassphraseAssessment {
         warnings,
         is_well_known_weak: well_known_weak,
         is_repeated_pattern: repeated,
+        is_obviously_weak_pattern: obviously_weak,
     }
 }
 
@@ -328,6 +356,82 @@ fn is_repeated_pattern(s: &str) -> bool {
     let ascending = chars.windows(2).all(|w| w[1] as u32 == w[0] as u32 + 1);
     let descending = chars.windows(2).all(|w| w[0] as u32 == w[1] as u32 + 1);
     ascending || descending
+}
+
+/// Whether the repetition is degenerate enough to refuse outright.
+///
+/// [`is_repeated_pattern`] is the *warning* test: it flags anything that repeats or runs
+/// monotonically, because that is worth telling the user about. Using that same broad
+/// test as the hard gate was too strict, and it refused real passphrases:
+///
+/// * `Tromso2024Tromso2024` — a 10-character unit repeated twice. It is flagged as a
+///   repeated pattern, but each unit carries ~60 bits on its own, so the whole string is
+///   not something an attacker guesses first. It was rejected outright.
+/// * `abcabcabcabc` — a 3-character unit repeated four times. That *is* degenerate: the
+///   whole string is determined by three characters.
+///
+/// The distinction is how much of the string the repeating unit actually determines. A
+/// unit repeated twice still leaves the unit itself as the secret; a short unit repeated
+/// many times leaves almost nothing. This refuses only the cases where repetition adds no
+/// real entropy:
+///
+/// * a single repeated character (`aaaaaaaaaaaa`),
+/// * a unit of 4 characters or fewer repeated to fill the string (`abcabcabcabc`),
+/// * a monotonic run covering the whole string (`abcdefghijkl`),
+/// * a deny-listed word repeated (`passwordpassword`).
+///
+/// Everything else that [`is_repeated_pattern`] flags is warned about and accepted.
+fn is_obviously_weak_pattern(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() < 4 {
+        return false;
+    }
+
+    // A single repeated character: the whole string is one character.
+    if chars.iter().all(|c| *c == chars[0]) {
+        return true;
+    }
+
+    // A short unit repeated to fill the string. The cutoff is 4: "abcabcabcabc" is
+    // determined by three characters, while "Tromso2024Tromso2024" is determined by ten.
+    // Four is where a repeated unit stops being a trivial guess and starts carrying real
+    // entropy, so units longer than that are only warned about.
+    const MAX_DEGENERATE_UNIT: usize = 4;
+    for period in 1..=chars.len() / 2 {
+        if period > MAX_DEGENERATE_UNIT {
+            break;
+        }
+        if !chars.len().is_multiple_of(period) {
+            continue;
+        }
+        if chars.chunks(period).all(|c| c == &chars[..period]) {
+            return true;
+        }
+    }
+
+    // A monotonic run covering the whole string.
+    let ascending = chars.windows(2).all(|w| w[1] as u32 == w[0] as u32 + 1);
+    let descending = chars.windows(2).all(|w| w[0] as u32 == w[1] as u32 + 1);
+    if ascending || descending {
+        return true;
+    }
+
+    // A deny-listed word repeated to reach the length floor. "passwordpassword" is not an
+    // exact deny-list entry, but it is the same guess twice.
+    for period in 1..=chars.len() / 2 {
+        if !chars.len().is_multiple_of(period) {
+            continue;
+        }
+        let unit: String = chars[..period].iter().collect();
+        if unit.chars().count() >= 4 && is_common_passphrase(&unit) {
+            // Confirm the whole string really is that unit repeated, not just a prefix.
+            if chars.chunks(period).all(|c| c == &chars[..period]) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Encrypt the identity seed into a user-storable artifact.
@@ -647,6 +751,7 @@ mod tests {
 
         let doubled = assess_passphrase("passwordpassword");
         assert!(doubled.warnings.iter().any(|w| w.contains("pattern")));
+        assert!(doubled.is_obviously_weak_pattern);
         assert!(!doubled.is_acceptable_for_vault());
 
         let repeated = assess_passphrase("ababababababab");
@@ -695,6 +800,56 @@ mod tests {
             assert!(
                 assess_passphrase(candidate).is_well_known_weak,
                 "`{candidate}` is exactly a listed weak passphrase and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_unit_repeated_twice_is_warned_about_but_accepted() {
+        // Regression test for the remaining over-strictness. `is_repeated_pattern` is the
+        // warning test and flags this, but refusing on it rejected real passphrases: a
+        // 10-character unit repeated twice still leaves the unit as the secret, so it is
+        // not a guess an attacker starts with. The hard gate is the narrower
+        // `is_obviously_weak_pattern`.
+        for candidate in [
+            "Tromso2024Tromso2024",
+            "Sunset-Beach-Sunset-Beach-",
+            "correct-horse-correct-horse-",
+        ] {
+            let assessment = assess_passphrase(candidate);
+            assert!(
+                assessment.is_repeated_pattern,
+                "`{candidate}` repeats a long unit and should still be warned about"
+            );
+            assert!(
+                !assessment.is_obviously_weak_pattern,
+                "`{candidate}` repeats a long unit; repetition alone must not refuse it"
+            );
+            assert!(
+                assessment.is_acceptable_for_vault(),
+                "`{candidate}` must be acceptable for the vault"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_repetition_is_still_refused() {
+        // The relaxation above must not let the cases the pattern check exists for through.
+        for candidate in [
+            "aaaaaaaaaaaaaaaaaaaa", // one character repeated
+            "abcabcabcabc",         // 3-character unit repeated
+            "abababababababab",     // 2-character unit repeated
+            "abcdefghijklmnop",     // monotonic run
+            "passwordpassword",     // deny-listed word repeated
+        ] {
+            let assessment = assess_passphrase(candidate);
+            assert!(
+                assessment.is_obviously_weak_pattern,
+                "`{candidate}` is degenerate repetition and must be refused"
+            );
+            assert!(
+                !assessment.is_acceptable_for_vault(),
+                "`{candidate}` must not be acceptable for the vault"
             );
         }
     }

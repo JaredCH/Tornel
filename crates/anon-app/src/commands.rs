@@ -671,6 +671,7 @@ pub fn assess_strength(state: State<'_, AppState>, candidate: String) -> UiResul
         entropy_bits: assessment.estimated_entropy_bits,
         is_well_known_weak: assessment.is_well_known_weak,
         is_repeated_pattern: assessment.is_repeated_pattern,
+        is_obviously_weak_pattern: assessment.is_obviously_weak_pattern,
         warnings: assessment.warnings,
         // The same call the vault makes when it creates the database, so the hint
         // and the enforcement cannot disagree.

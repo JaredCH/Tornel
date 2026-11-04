@@ -227,6 +227,10 @@ function scheduleStrengthCheck() {
       // ("passwordpassword") has high estimated entropy and is still refused by the
       // vault, so colouring by entropy alone produced a green bar over a rejected
       // passphrase. The bar must never look better than the policy allows.
+      //
+      // `acceptable` is the vault's own answer, so the bar cannot contradict the
+      // button. A passphrase that is merely *warned* about (a long unit repeated
+      // twice) is acceptable and shows as such; only a refusal turns the bar weak.
       fill.dataset.level = !view.acceptable
         ? "weak"
         : view.entropy_bits >= 80

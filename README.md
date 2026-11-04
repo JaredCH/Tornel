@@ -502,6 +502,15 @@ git push origin v0.1.0
 A manual `workflow_dispatch` run builds the same artifacts without creating a
 release, so the pipeline can be exercised before a tag exists.
 
+The `publish` job requires Windows and Linux but deliberately **not** Android. Android is
+the newest target and the one most likely to break on a toolchain change (NDK, Gradle, the
+vendored OpenSSL build), and a break there must not block the desktop packages. The job's
+condition uses `!cancelled()` rather than relying on the default gate, because GitHub ANDs
+an implicit `success()` into every job that declares `needs` — without it, a failed Android
+job skips the release even though the condition never mentions Android. That is what
+happened on the `v0.1.2` run: Windows and Linux both succeeded and the release was skipped
+because Android's SDK setup failed.
+
 ### Dependency advisories
 
 `cargo audit` runs in CI and fails on any advisory not listed in
@@ -670,11 +679,12 @@ so a forgotten database passphrase costs you history, not your contact code.
 #### What the passphrase policy actually requires
 
 The rule is **12 characters**, plus two rejections: the passphrase must not be exactly
-a well-known weak string (`password`, `letmein`, `monkey`, …), and it must not be a
-repeated or sequential pattern (`abcabcabcabc`, `abcdefghijkl`). Everything else is
-accepted, and the strength bar is advisory — it warns, it does not gate.
+a well-known weak string (`password`, `letmein`, `monkey`, …), and it must not be
+*degenerate* repetition (`aaaaaaaaaaaa`, `abcabcabcabc`, `abcdefghijkl`,
+`passwordpassword`). Everything else is accepted, and the strength bar is advisory — it
+warns, it does not gate.
 
-Two earlier behaviours were stricter than that and have been removed, because they
+Three earlier behaviours were stricter than that and have been removed, because they
 refused good passphrases:
 
 * The deny-list matched on **substring**, so any passphrase *containing* a listed word
@@ -683,10 +693,18 @@ refused good passphrases:
 * The setup screen's placeholder said **"16+ characters"** while the policy enforced 12,
   so the screen contradicted the rule it was describing. The placeholder now reads the
   minimum from Rust.
+* The pattern check was used as a **hard gate** even though it is deliberately broad. It
+  flags any repetition or monotonic run, which is worth warning about, but refusing on it
+  rejected long passphrases that merely repeat a substantial unit twice —
+  `Tromso2024Tromso2024` was refused outright. The hard gate is now the narrower
+  `is_obviously_weak_pattern`, which refuses only repetition that adds no real entropy: a
+  single repeated character, a unit of four characters or fewer repeated to fill the
+  string, a monotonic run, or a deny-listed word repeated. A long unit repeated twice is
+  warned about and accepted.
 
-The pattern check was already correct: it requires the run to span the whole passphrase,
-so `correct-horse-abc` is fine. That is now pinned by a test so it cannot be tightened
-into rejecting real passphrases.
+The pattern check still requires a run to span the whole passphrase, so `correct-horse-abc`
+is fine. That is pinned by a test so it cannot be tightened into rejecting real
+passphrases.
 
 The migration needs free space for a full second copy of the database, because it
 copies rather than rewriting in place. That is deliberate: an in-place `PRAGMA rekey`

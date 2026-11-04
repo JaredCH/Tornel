@@ -426,14 +426,22 @@ pub struct StrengthView {
     /// same facts the vault rejects on, instead of inferring from prose.
     pub is_well_known_weak: bool,
     /// Whether the candidate looks like a repeated or sequential pattern.
+    ///
+    /// This is the *warning* signal: it is deliberately broad. A long unit repeated
+    /// twice is flagged here but is still acceptable — see `is_obviously_weak_pattern`.
     pub is_repeated_pattern: bool,
+    /// Whether the repetition is degenerate enough that the vault refuses it.
+    ///
+    /// Narrower than `is_repeated_pattern`. The UI needs both so it can warn about
+    /// repetition without claiming the passphrase will be refused.
+    pub is_obviously_weak_pattern: bool,
     /// Human-readable warnings. Empty when nothing is wrong.
     pub warnings: Vec<String>,
     /// Whether the vault would accept this candidate.
     ///
     /// Stricter than `meets_minimum_length`: the database passphrase is the only thing
-    /// protecting the message history, so the deny-list and pattern checks are enforced
-    /// rather than merely warned about.
+    /// protecting the message history, so the deny-list and degenerate-pattern checks
+    /// are enforced rather than merely warned about.
     pub acceptable: bool,
 }
 
