@@ -146,15 +146,23 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: List artifacts
-        run: ls -la dist
+      # `upload-artifact` preserves the directory structure of the globs it was
+      # given, so the merged tree contains `deb/` and `appimage/` subdirectories.
+      # Flatten it first: the release should present a flat list of packages, and
+      # `sha256sum *` would otherwise fail on the directories.
+      - name: Flatten artifacts
+        run: |
+          mkdir -p out
+          find dist -type f \( -name '*.exe' -o -name '*.deb' -o -name '*.AppImage' \) \
+            -exec cp {} out/ \;
+          ls -la out
 
       # Checksums let a user verify a download without trusting the transport.
       # The app's whole premise is that the network is hostile, so shipping an
       # unverifiable binary would be inconsistent with that.
       - name: Generate checksums
         run: |
-          cd dist
+          cd out
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
@@ -165,10 +173,10 @@ jobs:
           draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
           generate_release_notes: true
           files: |
-            dist/*.exe
-            dist/*.deb
-            dist/*.AppImage
-            dist/SHA256SUMS.txt
+            out/*.exe
+            out/*.deb
+            out/*.AppImage
+            out/SHA256SUMS.txt
           body: |
             Tornel `anon` ${{ github.ref_name }}
 
