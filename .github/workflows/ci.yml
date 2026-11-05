@@ -195,6 +195,15 @@ jobs:
         with:
           targets: aarch64-linux-android
 
+      # JDK 21 must be installed *before* the Android SDK. `sdkmanager` refuses to run
+      # on the runner's default Java 11 ("This tool requires JDK 17 or later"), and
+      # `setup-android` invokes it to accept licenses, so the order is load-bearing.
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
       # `setup-android` defaults to `packages: 'tools platform-tools'`, but the legacy
       # `tools` package no longer exists in cmdline-tools 16.0 — the action fails with
       # "Failed to find package 'tools'" before any Rust code is compiled.
@@ -205,6 +214,17 @@ jobs:
 
       - name: Install NDK
         run: sdkmanager --install "ndk;27.0.12077973"
+
+      # The vendored OpenSSL build invokes the NDK's `ranlib` by its target-prefixed
+      # name, which the NDK does not ship — it provides `llvm-ranlib` only.
+      - name: Expose NDK tools under target-prefixed names
+        run: |
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "$NDK_BIN" >> "$GITHUB_PATH"
+          for target in aarch64-linux-android armv7a-linux-androideabi i686-linux-android x86_64-linux-android; do
+            ln -sf "$NDK_BIN/llvm-ranlib" "$NDK_BIN/${target}-ranlib"
+            ln -sf "$NDK_BIN/llvm-ar" "$NDK_BIN/${target}-ar"
+          done
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
