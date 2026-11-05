@@ -201,7 +201,9 @@ pub fn send_frame(
 /// Persist a received frame's plaintext, applying retention.
 ///
 /// Returns the storage id. Replay-checks against the outbox first so a duplicate
-/// delivery from a mailbox does not create a second row.
+/// delivery from a mailbox does not create a second row, then against the
+/// store's durable seen-frames table so a replay across a restart is also
+/// rejected — the in-memory set alone was lost on every relaunch.
 pub fn accept_frame(
     store: &Store,
     outbox: &Outbox,
@@ -211,6 +213,18 @@ pub fn accept_frame(
     received_at: i64,
 ) -> Result<DeliveryReport> {
     if !outbox.observe(frame.id()) {
+        return Ok(DeliveryReport {
+            id: frame.id(),
+            outcome: DeliveryOutcome::QueuedLocal,
+            duplicate: true,
+            bytes_sent: None,
+        });
+    }
+
+    // Durable check. `observe_frame` returns false when the id is already in
+    // the table, which is a replay across a restart. The in-memory entry added
+    // above is harmless: it holds the same id the table now holds.
+    if !store.observe_frame(frame.id().as_bytes(), received_at)? {
         return Ok(DeliveryReport {
             id: frame.id(),
             outcome: DeliveryOutcome::QueuedLocal,

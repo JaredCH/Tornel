@@ -1,10 +1,112 @@
 # Tornel (`anon`) — Serverless, 100% Tor v3 Onion P2P Messenger
 
-A Rust + Tauri v2 desktop and mobile communication application built around **zero application-operated servers**, **Tor v3 onion-service rendezvous routing** (via embedded Arti), **authenticated end-to-end encryption** (X25519 + Ed25519 for 1-on-1, RFC 9420 MLS for groups), **encrypted image sharing with mandatory attachment sanitization**, and **local-only SQLCipher storage with an automatic 90-day retention policy**. Group role authorization and forensic key erasure remain incomplete; see the risks below.
+<div align="center">
+
+**No servers. No phone numbers. No IP addresses. Just Tor.**
+
+[![CI](https://github.com/JaredCH/Tornel/actions/workflows/ci.yml/badge.svg)](https://github.com/JaredCH/Tornel/actions/workflows/ci.yml)
+[![Release](https://github.com/JaredCH/Tornel/actions/workflows/release.yml/badge.svg)](https://github.com/JaredCH/Tornel/actions/workflows/release.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](./Cargo.toml)
+[![Rust 1.92+](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](./rust-toolchain.toml)
+
+</div>
+
+Tornel is a **serverless, end-to-end encrypted messenger** for desktop and Android, written in Rust with Tauri v2. There is no account server, no push relay, no message broker — nothing to subpoena, breach, or log. Every running instance hosts its own **Tor v3 onion service** (via embedded Arti), and peers meet at a rendezvous point over a 6-hop circuit: **neither side ever learns the other's IP address**. Your identity is a locally generated Ed25519 + X25519 keypair encoded into a self-checksummed Bech32m contact code (`anon1…`) — no phone number, no email, no username. Messages are authenticated end-to-end (X25519 + Ed25519 for 1-on-1, RFC 9420 MLS for groups), images are stripped of EXIF/GPS and rebuilt before they ever leave the device, and everything is stored locally in SQLCipher behind a passphrase **you** hold, with an automatic 90-day retention policy.
+
+| | |
+| --- | --- |
+| ![Desktop chat](docs/images/desktop-chat.png) | ![Mobile chat](docs/images/mobile-chat.png) |
+| *Desktop — 2-pane chat workspace* | *Android — responsive single-pane layout* |
+
+**What you get:**
+
+- 🔒 **Zero central servers** — peers connect directly over Tor v3 onion rendezvous; there is no infrastructure to compromise
+- 🕵️ **No IP leakage, ever** — the transport gate refuses to transmit unless a published onion service is ready; builds without Tor fail closed, and an automated CI scan forbids direct sockets
+- 🪪 **Self-sovereign identity** — Ed25519 + X25519 keys generated from OS entropy; your contact code is the only thing you share
+- 👥 **MLS group chat (RFC 9420)** — ratcheting that locks removed members out of future messages, with signed, human-in-the-loop consent for sensitive rotations
+- 🖼️ **Mandatory attachment sanitization** — every image is decoded, stripped of EXIF/GPS/XMP/thumbnails, rebuilt, and renamed `image.jpg` before sending; no opt-out
+- 🗄️ **SQLCipher at rest + 90-day retention** — Argon2id-derived key from a passphrase you type at launch, automatic TTL purge across every content table
+- 📱 **Desktop + Android** — one codebase, responsive UI, signed APKs from CI
 
 > **Security Status & Audit Notice:** Embedded Arti bootstrap, v3 onion-service descriptor publication, and authenticated two-peer 1-on-1 and MLS group message/attachment delivery over Tor rendezvous have been verified end-to-end (both standalone and alongside an active Tor Browser daemon on ports `9150`/`9151`). However, this software has not yet undergone a formal third-party cryptographic or network-anonymity audit. Review the **Mitigated vs. Remaining Risks** section below before relying on it in high-adversary environments.
 
 The full engineering blueprint is in [plan.md](./plan.md).
+
+---
+
+## How it works
+
+### 1. You hold the keys — the app starts locked
+
+On first launch you choose a passphrase. It derives the SQLCipher database key via Argon2id (`64 MiB`, 3 passes) and is **never stored on disk** — nothing machine-held remains. Your identity seed lives in the OS keychain (Windows Credential Manager / macOS Keychain / Linux Secret Service). Forget the passphrase and the history is unreadable; that is what makes it protection rather than a formality. Your *contact code* survives via an optional user-held escrow artifact.
+
+| | |
+| --- | --- |
+| ![Unlock screen](docs/images/launch-unlock.png) | ![Personas](docs/images/launch-personas.png) |
+| *Every launch asks for your passphrase* | *Optional personas: separate processes, vaults, and Tor state* |
+
+### 2. Your identity is a contact code, not a phone number
+
+The app generates an Ed25519 signing keypair + X25519 agreement keypair from OS entropy and encodes them into a Bech32m contact code with a BLAKE3 checksum. Display names are local labels only. Peers exchange **signed invites** (`tornel1:…`) that bind the identity, onion address, and discovery key with an Ed25519 signature — the signature prevents alteration, and the fingerprint should be verified out of band.
+
+| | |
+| --- | --- |
+| ![Identity & keys](docs/images/desktop-identity.png) | ![Add friend](docs/images/desktop-add-friend.png) |
+| *Identity & Keys — contact code, fingerprint, escrow* | *Adding a peer from a signed invite* |
+
+### 3. Messages travel over Tor rendezvous — both ways
+
+Every instance hosts its own Tor v3 hidden service through embedded Arti (isolated from any Tor Browser install). When you send, your client connects out through Tor to the peer's onion service; the two circuits meet at a rendezvous point, and neither peer learns the other's IP. Frames are padded into fixed size buckets (512 B → 512 KiB), AEAD-encrypted, and signed. If the peer is offline, the sealed frame is queued on **your** disk and retried — never handed to a server.
+
+### 4. Groups ratchet with MLS, and removal requires consent
+
+Group messages use RFC 9420 MLS (`openmls`): every membership change advances the epoch and derives fresh tree secrets, so a removed member is cryptographically locked out of future messages (verified by test). Sensitive rotations — like removing a member — open a **nonce-bound, Ed25519-signed consent modal** before taking effect; ignoring it fails closed.
+
+| | |
+| --- | --- |
+| ![Group chat](docs/images/desktop-group.png) | ![Mobile chat list](docs/images/mobile-chat-list.png) |
+| *Group chat with the Members & Roles drawer* | *Mobile conversation list* |
+
+### 5. Images are sanitized before they leave the device
+
+Every outgoing attachment — direct or group — passes through a fail-closed Rust sanitizer: decoded with bounded allocations, stripped of EXIF/GPS/XMP/ICC/thumbnails/trailing data, cropped ~1–2% per edge, downscaled to ≤1280 px, mildly blurred, given randomized tonal changes, and re-encoded as a fresh JPEG named `image.jpg`. Unsupported formats (PDF, SVG, GIF, HEIC, …) are rejected outright. There is no opt-out.
+
+### 6. Everything expires in 90 days
+
+Every content table — messages, conversations, attachments, mailbox buffers, the consent audit log — carries an absolute `expires_at` deadline. The app purges on unlock and every 24 hours, and reads reject expired rows even between purges. A CI test fails if a new content table is added without an expiry column.
+
+### The architecture in one picture
+
+```mermaid
+flowchart TB
+  UI["Webview — presentation + consent only"] --> APP["anon-app — Tauri shell"]
+  APP --> IPC["anon-ipc — command boundary"]
+    IPC --> MSG["anon-messaging — framing, delivery, replay, mailbox host"]
+  IPC --> CON["anon-consent — rotation gate"]
+    MSG --> MLS["anon-mls — MLS group ratcheting"]
+    MSG --> TR["anon-transport — AnonymityTransport"]
+    MSG --> ST["anon-storage — SQLCipher + TTL + mailbox"]
+    CON --> ST
+    MLS --> ST
+    TR --> ART["Arti (feature-gated): client + onion service"]
+    TR --> OFF["OfflineTransport (fails closed)"]
+    ST --> KR["KeyRing — per-month derived keys, logical retirement"]
+  CORE["anon-core — keys, codes, escrow, retention"] -.-> ST
+  CORE -.-> CON
+  CORE -.-> IPC
+```
+
+| Crate | Responsibility |
+| --- | --- |
+| `anon-core` | Ed25519/X25519 identity, Bech32m contact codes, escrow, retention math |
+| `anon-storage` | SQLCipher store, `STRICT` schema, 90-day purge, logical bucket retirement, peer mailbox |
+| `anon-transport` | `AnonymityTransport` trait, onion routes, fail-closed gate, Arti client + onion service |
+| `anon-mls` | RFC 9420 group ratcheting over `openmls`, persisted into the same SQLCipher file |
+| `anon-messaging` | Wire format, padding, replay protection, delivery, group messaging, mailbox policy |
+| `anon-consent` | Signed rotation proposals, consent gate, audit log |
+| `anon-ipc` | The Rust↔webview boundary and its validation |
+| `anon-app` | The Tauri v2 desktop shell: command adapter + webview. No crypto. |
+| `anon-cli` | `anon-demo`, a two-process walkthrough of the stack |
 
 ---
 
@@ -208,42 +310,9 @@ a duplicate.
 cargo test -p anon-messaging --test send_queue
 ```
 
-## Architecture
+## Architecture notes
 
-```mermaid
-flowchart TB
-  UI["Webview — presentation + consent only"] --> APP["anon-app — Tauri shell"]
-  APP --> IPC["anon-ipc — command boundary"]
-    IPC --> MSG["anon-messaging — framing, delivery, replay, mailbox host"]
-  IPC --> CON["anon-consent — rotation gate"]
-    MSG --> MLS["anon-mls — MLS group ratcheting"]
-    MSG --> TR["anon-transport — AnonymityTransport"]
-    MSG --> ST["anon-storage — SQLCipher + TTL + mailbox"]
-    CON --> ST
-    MLS --> ST
-    TR --> ART["Arti (feature-gated): client + onion service"]
-    TR --> OFF["OfflineTransport (fails closed)"]
-    ST --> KR["KeyRing — per-month derived keys, logical retirement"]
-    CORE["anon-core — keys, codes, escrow, retention"] -.-> ST
-    CORE -.-> CON
-    CORE -.-> IPC
-  ```
-
-  ### Crates
-
-  | Crate | Responsibility | Plan sections |
-  | --- | --- | --- |
-  | `anon-core` | Ed25519/X25519 identity, Bech32m contact codes, escrow, retention math | §2, §6 |
-  | `anon-storage` | SQLCipher store, `STRICT` schema, 90-day purge, logical bucket retirement, peer mailbox | §6, §4.4 |
-  | `anon-transport` | `AnonymityTransport` trait, onion routes, fail-closed gate, Arti client + onion service | §3 |
-  | `anon-mls` | RFC 9420 group ratcheting over `openmls`, persisted into the same SQLCipher file | §4.2, §4.3 |
-  | `anon-messaging` | Wire format, padding, replay protection, delivery, group messaging, mailbox policy | §9, §4.4 |
-  | `anon-consent` | Signed rotation proposals, consent gate, audit log | §5 |
-  | `anon-ipc` | The Rust↔webview boundary and its validation | §7.3 |
-  | `anon-app` | The Tauri v2 desktop shell: command adapter + webview. No crypto. | §7.3 |
-  | `anon-cli` | `anon-demo`, a two-process walkthrough of the stack | §7.1 |
-
-  ### Why `anon-mls` is separate from `anon-messaging`
+### Why `anon-mls` is separate from `anon-messaging`
 
   `plan.md` §3.4 names Arti as the highest-risk dependency and §4.2 names MLS as the
   highest-complexity one. Keeping each behind its own crate and its own trait

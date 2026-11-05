@@ -35,6 +35,98 @@
   padding: 10px;
   font: inherit;
 }
+
+/* ---- Persona-first launch ---- */
+
+.persona-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.persona-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-2);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.persona-list li:hover,
+.persona-list li:focus-visible {
+  border-color: var(--accent);
+  background: var(--panel);
+  outline: none;
+}
+
+.persona-list .persona-avatar {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  color: var(--text);
+  background: conic-gradient(from 140deg, var(--accent), var(--accent-2), var(--accent));
+  box-shadow: inset 0 0 0 5px var(--panel-2);
+}
+
+.persona-list .persona-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.full-width { width: 100%; }
+
+/* ---- Signed-invite preview (identity modal + add-friend modal) ---- */
+
+.invite-preview { margin: 8px 0; }
+.invite-preview dt { color: var(--muted); font-size: 12px; }
+.invite-preview dd {
+  margin: 0 0 6px;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.invite-raw summary { cursor: pointer; }
+.invite-raw code {
+  display: block;
+  max-height: 96px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  margin-top: 6px;
+}
+
+.invite-preview-box {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-2);
+  padding: 10px 12px;
+  margin: 10px 0;
+}
+.invite-preview-box dt { color: var(--muted); font-size: 12px; }
+.invite-preview-box dd {
+  margin: 0 0 6px;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 12px;
+}
 .privacy-option { display: flex; align-items: center; gap: 10px; margin: 12px 0; }
 .privacy-option input { width: 18px; height: 18px; flex: 0 0 18px; }
 #invite-bundle { display: block; max-height: 96px; overflow: auto; overflow-wrap: anywhere; white-space: normal; }

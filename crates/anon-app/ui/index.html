@@ -25,17 +25,48 @@
           </div>
         </div>
 
-        <section class="persona-controls" aria-label="Personas">
-          <h2>Personas</h2>
+        <!--
+          Persona-first launch: the primary question is "who is signing in?",
+          not "type a passphrase". Saved personas are one-click cards that open
+          that identity in its own window; creating a new identity is the
+          explicit secondary action below them.
+        -->
+        <section id="launch-continue" aria-label="Continue with an existing identity">
+          <h2>Continue</h2>
+          <ul id="launch-persona-list" class="persona-list"></ul>
+          <p id="launch-persona-empty" class="hint small" hidden>
+            No identities on this device yet.
+          </p>
           <div class="row">
-            <select id="launch-personas" aria-label="Saved persona"></select>
-            <button id="launch-open-persona" class="ghost">Open</button>
-          </div>
-          <div class="row">
-            <input id="launch-persona-name" maxlength="64" placeholder="New persona name" aria-label="New persona name" />
-            <button id="launch-create-persona" class="ghost">Create</button>
+            <button id="launch-new-identity" class="ghost full-width">
+              + Create a new identity
+            </button>
           </div>
           <p id="launch-persona-result" class="hint small" role="status"></p>
+        </section>
+
+        <!--
+          Restore from escrow: only meaningful on a device with no identity yet.
+          Hidden by default; the launch logic shows it when the keychain has no
+          seed and the vault is fresh.
+        -->
+        <section id="launch-restore" hidden aria-label="Restore from escrow">
+          <h2>Restore an identity</h2>
+          <p class="hint small">
+            Have an escrow artifact (<code>anon-escrow.bin</code>) from another device?
+            Import it here to continue with that identity instead of creating a new one.
+          </p>
+          <div class="row">
+            <input id="restore-file" type="file" accept=".bin,application/octet-stream" aria-label="Escrow artifact file" />
+          </div>
+          <div class="row">
+            <input id="restore-passphrase" type="password" autocomplete="off"
+                   placeholder="Escrow passphrase" spellcheck="false" aria-label="Escrow passphrase" />
+          </div>
+          <div class="row">
+            <button id="restore-submit" class="ghost full-width">Restore identity</button>
+          </div>
+          <p id="restore-result" class="hint small" role="status"></p>
         </section>
 
         <!-- Fresh install / migration: choose a passphrase -->
@@ -457,6 +488,18 @@
           <div class="row">
             <input id="peer-label" type="text" maxlength="64" placeholder="Friend nickname / display label (e.g. Bob)" />
           </div>
+          <!-- Decoded preview of a pasted signed invite, shown before the add commits. -->
+          <div id="peer-invite-preview" class="invite-preview-box" hidden>
+            <dl class="kv">
+              <dt>Signed name</dt>
+              <dd id="preview-name">…</dd>
+              <dt>Contact code</dt>
+              <dd><code id="preview-code">…</code></dd>
+              <dt>Tor address</dt>
+              <dd><code id="preview-onion">…</code></dd>
+            </dl>
+            <p id="preview-note" class="hint small"></p>
+          </div>
           <div class="row modal-footer">
             <button id="add-peer" class="primary-btn">Save Friend &amp; Open Chat</button>
             <button class="ghost" data-close-modal>Cancel</button>
@@ -539,10 +582,26 @@
 
           <div class="modal-section">
             <h3>Signed Invite</h3>
-            <div class="code-row">
-              <code id="invite-bundle">waiting for Tor…</code>
+            <p class="hint small">
+              Share this with a friend over any channel. It carries your name, contact code,
+              Tor address, and discovery key — all signed, so nothing can be altered in transit.
+            </p>
+            <dl class="kv invite-preview">
+              <dt>Name</dt>
+              <dd id="invite-name">…</dd>
+              <dt>Contact code</dt>
+              <dd><code id="invite-short-code">…</code></dd>
+              <dt>Tor address</dt>
+              <dd><code id="invite-onion">…</code></dd>
+            </dl>
+            <p id="invite-state" class="hint small" role="status"></p>
+            <div class="row">
               <button id="copy-invite-bundle" class="primary-btn">Copy Invite</button>
             </div>
+            <details class="invite-raw">
+              <summary class="hint small">Show raw invite text</summary>
+              <code id="invite-bundle">waiting for Tor…</code>
+            </details>
           </div>
 
           <div class="modal-section">

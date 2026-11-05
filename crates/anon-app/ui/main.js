@@ -175,6 +175,9 @@ function hideLaunchScreens() {
   launch.unlock().hidden = true;
   launch.interrupted().hidden = true;
   launch.blocked().hidden = true;
+  // The restore section is part of the fresh-install flow, not a vault state.
+  const restore = $("launch-restore");
+  if (restore) restore.hidden = true;
 }
 
 /**
@@ -204,18 +207,22 @@ function renderLaunch(view) {
   }
 
   if (view.is_setup) {
-    launch.setup().hidden = false;
-    // A migration and a fresh install both ask the user to choose a passphrase, but the
-    // explanation differs and the user deserves to know which one they are in. An
-    // existing install being told "choose a passphrase" without being told *why* reads as
-    // "your data is gone".
     if (view.state === "needs_migration") {
+      // A migration must complete before anything else, so show the passphrase
+      // form directly — the persona-first flow does not apply mid-migration.
+      launch.setup().hidden = false;
       $("setup-title").textContent = "Choose a passphrase for this device";
       $("setup-explain").textContent =
         "This device already has a database, encrypted with a key the app generated for " +
         "you. Choose a passphrase to replace it. Your messages are kept — the change is " +
         "made on a copy and verified before anything is replaced.";
     } else {
+      // Fresh install: persona-first. The passphrase form stays hidden behind
+      // "Create a new identity" until the user asks for it, and the restore
+      // section is offered alongside for anyone with an escrow artifact.
+      launch.setup().hidden = true;
+      const restore = $("launch-restore");
+      if (restore) restore.hidden = false;
       $("setup-title").textContent = "Choose a passphrase";
       $("setup-explain").textContent =
         "This passphrase protects your message history on this device. It is never " +
@@ -227,7 +234,6 @@ function renderLaunch(view) {
     if (view.min_chars) {
       $("setup-passphrase").placeholder = `Vault passphrase (${view.min_chars}+ characters)`;
     }
-    $("setup-passphrase").focus();
     return;
   }
 
@@ -428,6 +434,8 @@ let cachedGroupMembers = [];
 // Signature of the last rendered message list, so an unchanged conversation is not
 // torn down and rebuilt on every refresh tick.
 let lastMessagesSignature = "";
+// Same idea for the group message list, which has its own DOM.
+let lastGroupMessagesSignature = "";
 // Same idea for the sidebar: the 3 s tick rebuilt it even when nothing changed.
 let lastConversationsSignature = "";
 let selectedConversationId = null;
@@ -437,19 +445,57 @@ let sidebarSearchQuery = "";
 let stagedAttachment = null; // { name, mime, size, dataUrl }
 let stagedGroupAttachment = null; // { name, mime, size, dataUrl }
 
+/**
+ * Refresh the signed-invite display in the identity modal.
+ *
+ * The labeled rows (name / short code / onion) show what a recipient will see,
+ * and the state line says honestly what is not ready yet: the invite cannot be
+ * minted until the onion service has published, so "waiting for Tor…" is the
+ * truth, not a placeholder.
+ */
 async function updateInviteBundleDisplay() {
   const el = $("invite-bundle");
   if (!el) return;
-  if (selfContactCode && selfOnionAddress && selfOnionAddress.endsWith(".onion")) {
+
+  const nameEl = $("invite-name");
+  const codeEl = $("invite-short-code");
+  const onionEl = $("invite-onion");
+  const stateEl = $("invite-state");
+  const copyBtn = $("copy-invite-bundle");
+
+  const torReady = selfOnionAddress && selfOnionAddress.endsWith(".onion");
+
+  if (nameEl) nameEl.textContent = selfDisplayName || "(no name set)";
+  if (codeEl) codeEl.textContent = selfContactCode ? `${selfContactCode.slice(0, 24)}…` : "…";
+  if (onionEl) onionEl.textContent = torReady ? `${selfOnionAddress.slice(0, 24)}….onion` : "…";
+
+  if (selfContactCode && torReady) {
     try {
       el.textContent = await invoke("export_invite");
+      if (stateEl) {
+        stateEl.textContent = "Ready to share.";
+        stateEl.classList.remove("error");
+      }
+      if (copyBtn) copyBtn.disabled = false;
     } catch {
       el.textContent = "Invite unavailable";
+      if (stateEl) stateEl.textContent = "The invite could not be signed.";
+      if (copyBtn) copyBtn.disabled = true;
     }
   } else if (selfContactCode) {
     el.textContent = `${selfContactCode} (waiting for .onion…)`;
+    if (stateEl) {
+      stateEl.textContent = "Waiting for the Tor onion service to publish — usually under a minute.";
+      stateEl.classList.remove("error");
+    }
+    if (copyBtn) copyBtn.disabled = true;
   } else {
     el.textContent = "waiting for Tor…";
+    if (stateEl) {
+      stateEl.textContent = "Starting the embedded Tor client…";
+      stateEl.classList.remove("error");
+    }
+    if (copyBtn) copyBtn.disabled = true;
   }
 }
 
@@ -473,6 +519,9 @@ function closeModals() {
   for (const card of backdrop.querySelectorAll(".modal-card")) {
     card.hidden = true;
   }
+  // A stale preview from the last paste must not greet the next open.
+  const preview = $("peer-invite-preview");
+  if (preview) preview.hidden = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -853,6 +902,7 @@ async function selectConversation(conversationId, labelText, explicitOnion) {
   selectedGroupId = null;
   // Force a rebuild: the signature belongs to the conversation we are leaving.
   lastMessagesSignature = "";
+  lastGroupMessagesSignature = "";
 
   $("chat-empty-state").hidden = true;
   $("group-detail").hidden = true;
@@ -999,100 +1049,170 @@ function parseMessageBody(rawBody) {
   return { isAttachment: false, text: rawBody };
 }
 
+/**
+ * Build one message row's DOM.
+ *
+ * Shared by the direct and group lists so the two cannot drift apart. Returns
+ * the `<li>`; the caller appends it.
+ */
+function buildMessageRow(m, { isGroup, memberInfo }) {
+  // Exact attribution: compare the full sender code, not the 12-char display
+  // fingerprint, which can collide between two contacts sharing a prefix.
+  const isOutgoing = selfContactCode && m.sender_code === selfContactCode;
+  const li = document.createElement("li");
+  li.className = `msg-row ${isOutgoing ? "outgoing" : "incoming"}`;
+  li.dataset.messageId = m.message_id;
+
+  const bubble = document.createElement("div");
+  bubble.className = "msg-bubble";
+
+  if (isGroup) {
+    const memberRole = memberInfo?.role || (isOutgoing ? "owner" : "member");
+    const senderLabel = isOutgoing
+      ? `${selfDisplayName || "You"}`
+      : memberInfo?.display_name
+        ? `${memberInfo.display_name} (${m.sender_fingerprint})`
+        : m.sender_fingerprint;
+    const senderHeader = document.createElement("div");
+    senderHeader.className = "msg-sender-header";
+    const sName = document.createElement("span");
+    sName.textContent = senderLabel;
+    senderHeader.append(sName, makeRoleBadge(memberRole));
+    bubble.appendChild(senderHeader);
+  }
+
+  const parsed = parseMessageBody(m.body);
+  if (parsed.isAttachment && parsed.dataUrl.startsWith("data:")) {
+    const attachWrap = document.createElement("div");
+    attachWrap.className = "msg-attachment";
+
+    if (parsed.mime.startsWith("image/")) {
+      const img = document.createElement("img");
+      img.src = parsed.dataUrl;
+      img.alt = parsed.name;
+      attachWrap.appendChild(img);
+    }
+
+    const card = document.createElement("div");
+    card.className = "file-card";
+    const icon = document.createElement("span");
+    icon.className = "file-card-icon";
+    icon.textContent = parsed.mime.startsWith("image/") ? "🖼️" : "📄";
+
+    const meta = document.createElement("div");
+    meta.className = "file-card-meta";
+    const fname = document.createElement("div");
+    fname.className = "file-card-name";
+    fname.textContent = parsed.name;
+    const fsize = document.createElement("div");
+    fsize.className = "file-card-size";
+    fsize.textContent = `${formatBytes(parsed.size)} · ${parsed.mime}`;
+    meta.append(fname, fsize);
+
+    const dl = document.createElement("a");
+    dl.href = parsed.dataUrl;
+    dl.download = parsed.name;
+    dl.className = "ghost small-btn";
+    dl.style.textDecoration = "none";
+    dl.textContent = "Save";
+
+    card.append(icon, meta, dl);
+    attachWrap.appendChild(card);
+    bubble.appendChild(attachWrap);
+
+    if (parsed.caption) {
+      const cap = document.createElement("div");
+      cap.className = "msg-text";
+      cap.textContent = parsed.caption;
+      bubble.appendChild(cap);
+    }
+  } else {
+    const textDiv = document.createElement("div");
+    textDiv.className = "msg-text";
+    textDiv.textContent = m.body;
+    bubble.appendChild(textDiv);
+  }
+
+  const meta = document.createElement("div");
+  meta.className = "msg-meta";
+  const who = isOutgoing ? "You" : m.sender_fingerprint;
+  meta.textContent = isGroup
+    ? `${when(m.sent_at)} · TTL ${when(m.expires_at)}`
+    : `${who} · ${when(m.sent_at)} · TTL ${when(m.expires_at)}`;
+
+  li.append(bubble, meta);
+  return li;
+}
+
+/**
+ * Whether the scroll box is pinned to the bottom (within a small tolerance).
+ *
+ * Autoscroll must follow the user, not fight them: if they scrolled up to read
+ * history, new arrivals must not yank the view down.
+ */
+function isPinnedToBottom(scrollBox) {
+  if (!scrollBox) return true;
+  return scrollBox.scrollHeight - scrollBox.scrollTop - scrollBox.clientHeight < 40;
+}
+
+/**
+ * Refresh the direct-conversation message list.
+ *
+ * The list is appended to incrementally: rows already rendered are kept, so a
+ * 3 s tick that finds one new message appends one row instead of tearing down
+ * and rebuilding the whole list (which discarded scroll position and forced a
+ * full layout pass). A shrinking list — retention purge — still rebuilds.
+ */
 async function refreshConversationMessages(conversationId) {
   const list = $("conversation-messages");
   if (!list) return;
   try {
     const items = await invoke("messages", { conversation_id: conversationId });
-    // Rebuilding the whole list every 3 s discarded the user's scroll position and
-    // forced a full layout pass on every tick. Skip the rebuild when nothing changed.
     const signature = `${conversationId}\u0000${items.length}\u0000${items
-      .map((m) => `${m.sent_at}:${m.body.length}`)
+      .map((m) => `${m.message_id}:${m.sent_at}:${m.body.length}`)
       .join(",")}`;
     if (signature === lastMessagesSignature) return;
-    lastMessagesSignature = signature;
 
-    list.innerHTML = "";
+    const scrollBox = $("messages-scroll");
+    const wasPinned = isPinnedToBottom(scrollBox);
+
+    // Rows are keyed by message id. Existing rows whose ids still appear are
+    // kept in place; only genuinely new ids are appended.
+    const existing = new Map();
+    for (const row of list.querySelectorAll(".msg-row")) {
+      existing.set(row.dataset.messageId, row);
+    }
+    const incomingIds = new Set(items.map((m) => m.message_id));
+    const canAppend =
+      existing.size > 0 &&
+      items.length > existing.size &&
+      items.slice(0, items.length - existing.size).every((m) => !existing.has(m.message_id)) &&
+      items.slice(items.length - existing.size).every((m) => existing.has(m.message_id));
+
+    if (!canAppend) {
+      list.innerHTML = "";
+    }
+
     if (!items.length) {
       const li = document.createElement("li");
       li.className = "empty";
       li.textContent = "No messages yet. Say hello or share an image/file over Tor!";
       list.appendChild(li);
+      lastMessagesSignature = signature;
       return;
     }
 
+    // Remove a stale empty-state row before appending real messages.
+    const emptyRow = list.querySelector("li.empty");
+    if (emptyRow) emptyRow.remove();
+
     for (const m of items) {
-      const isOutgoing =
-        selfContactShort && m.sender_fingerprint === selfContactShort;
-      const li = document.createElement("li");
-      li.className = `msg-row ${isOutgoing ? "outgoing" : "incoming"}`;
-
-      const bubble = document.createElement("div");
-      bubble.className = "msg-bubble";
-
-      const parsed = parseMessageBody(m.body);
-      if (parsed.isAttachment && parsed.dataUrl.startsWith("data:")) {
-        const attachWrap = document.createElement("div");
-        attachWrap.className = "msg-attachment";
-
-        if (parsed.mime.startsWith("image/")) {
-          const img = document.createElement("img");
-          img.src = parsed.dataUrl;
-          img.alt = parsed.name;
-          attachWrap.appendChild(img);
-        }
-
-        const card = document.createElement("div");
-        card.className = "file-card";
-        const icon = document.createElement("span");
-        icon.className = "file-card-icon";
-        icon.textContent = parsed.mime.startsWith("image/") ? "🖼️" : "📄";
-
-        const meta = document.createElement("div");
-        meta.className = "file-card-meta";
-        const fname = document.createElement("div");
-        fname.className = "file-card-name";
-        fname.textContent = parsed.name;
-        const fsize = document.createElement("div");
-        fsize.className = "file-card-size";
-        fsize.textContent = `${formatBytes(parsed.size)} · ${parsed.mime}`;
-        meta.append(fname, fsize);
-
-        const dl = document.createElement("a");
-        dl.href = parsed.dataUrl;
-        dl.download = parsed.name;
-        dl.className = "ghost small-btn";
-        dl.style.textDecoration = "none";
-        dl.textContent = "Save";
-
-        card.append(icon, meta, dl);
-        attachWrap.appendChild(card);
-        bubble.appendChild(attachWrap);
-
-        if (parsed.caption) {
-          const cap = document.createElement("div");
-          cap.className = "msg-text";
-          cap.textContent = parsed.caption;
-          bubble.appendChild(cap);
-        }
-      } else {
-        const textDiv = document.createElement("div");
-        textDiv.className = "msg-text";
-        textDiv.textContent = m.body;
-        bubble.appendChild(textDiv);
-      }
-
-      const meta = document.createElement("div");
-      meta.className = "msg-meta";
-      const who = isOutgoing ? "You" : m.sender_fingerprint;
-      meta.textContent = `${who} · ${when(m.sent_at)} · TTL ${when(m.expires_at)}`;
-
-      li.append(bubble, meta);
-      list.appendChild(li);
+      if (existing.has(m.message_id)) continue;
+      list.appendChild(buildMessageRow(m, { isGroup: false, memberInfo: null }));
     }
 
-    const scrollBox = $("messages-scroll");
-    if (scrollBox) {
+    lastMessagesSignature = signature;
+    if (wasPinned && scrollBox) {
       scrollBox.scrollTop = scrollBox.scrollHeight;
     }
   } catch (err) {
@@ -1243,11 +1363,15 @@ async function sendMessage() {
       ? `⏳ ${state.label} — will send when the peer is reachable`
       : `✓ ${state.label ?? state}`;
     result.classList.add(queued ? "hint" : "ok");
+    // Only clear the composer after the backend accepted the send. A failure
+    // must leave the text and attachment in place so the user can retry
+    // without retyping.
     $("body").value = "";
     clearStagedAttachment();
     await refreshConversations();
   } catch (err) {
     showError(result, err);
+    // The composer keeps its content; the user edits or retries.
   } finally {
     sendInFlight = false;
     await refreshTransport();
@@ -1328,6 +1452,8 @@ async function refreshGroups() {
 async function selectGroup(groupId) {
   selectedGroupId = groupId;
   selectedConversationId = null;
+  // Force a rebuild: the signature belongs to the group we are leaving.
+  lastGroupMessagesSignature = "";
 
   $("chat-empty-state").hidden = true;
   $("conversation-detail").hidden = true;
@@ -1550,105 +1676,59 @@ async function refreshGroupMessages(groupId) {
   if (!list || !groupId) return;
   try {
     const items = await invoke("messages", { conversation_id: groupId });
-    list.innerHTML = "";
+    const signature = `group\u0000${groupId}\u0000${items.length}\u0000${items
+      .map((m) => `${m.message_id}:${m.sent_at}:${m.body.length}`)
+      .join(",")}`;
+    if (signature === lastGroupMessagesSignature) return;
+
+    const scrollBox = $("group-messages-scroll");
+    const wasPinned = isPinnedToBottom(scrollBox);
+
+    const existing = new Map();
+    for (const row of list.querySelectorAll(".msg-row")) {
+      existing.set(row.dataset.messageId, row);
+    }
+    const canAppend =
+      existing.size > 0 &&
+      items.length > existing.size &&
+      items.slice(0, items.length - existing.size).every((m) => !existing.has(m.message_id)) &&
+      items.slice(items.length - existing.size).every((m) => existing.has(m.message_id));
+
+    if (!canAppend) {
+      list.innerHTML = "";
+    }
+
     if (!items.length) {
       const li = document.createElement("li");
       li.className = "empty";
       li.textContent = "No group messages yet — send an MLS-encrypted message or attachment below!";
       list.appendChild(li);
+      lastGroupMessagesSignature = signature;
       return;
     }
 
+    const emptyRow = list.querySelector("li.empty");
+    if (emptyRow) emptyRow.remove();
+
     for (const m of items) {
-      const isOutgoing = selfContactShort && m.sender_fingerprint === selfContactShort;
-      const memberInfo = cachedGroupMembers.find(
-        (gm) => gm.contact_code_short === m.sender_fingerprint || (isOutgoing && gm.is_self)
-      );
-      const memberRole = memberInfo?.role || (isOutgoing ? "owner" : "member");
-      const senderLabel = isOutgoing
-        ? `${selfDisplayName || "You"}`
-        : memberInfo?.display_name
-          ? `${memberInfo.display_name} (${m.sender_fingerprint})`
-          : m.sender_fingerprint;
-
-      const li = document.createElement("li");
-      li.className = `msg-row ${isOutgoing ? "outgoing" : "incoming"}`;
-
-      const bubble = document.createElement("div");
-      bubble.className = "msg-bubble";
-
-      const senderHeader = document.createElement("div");
-      senderHeader.className = "msg-sender-header";
-      const sName = document.createElement("span");
-      sName.textContent = senderLabel;
-      senderHeader.append(sName, makeRoleBadge(memberRole));
-      bubble.appendChild(senderHeader);
-
-      const parsed = parseMessageBody(m.body);
-      if (parsed.isAttachment && parsed.dataUrl.startsWith("data:")) {
-        const attachWrap = document.createElement("div");
-        attachWrap.className = "msg-attachment";
-
-        if (parsed.mime.startsWith("image/")) {
-          const img = document.createElement("img");
-          img.src = parsed.dataUrl;
-          img.alt = parsed.name;
-          attachWrap.appendChild(img);
-        }
-
-        const card = document.createElement("div");
-        card.className = "file-card";
-        const icon = document.createElement("span");
-        icon.className = "file-card-icon";
-        icon.textContent = parsed.mime.startsWith("image/") ? "🖼️" : "📄";
-
-        const meta = document.createElement("div");
-        meta.className = "file-card-meta";
-        const fname = document.createElement("div");
-        fname.className = "file-card-name";
-        fname.textContent = parsed.name;
-        const fsize = document.createElement("div");
-        fsize.className = "file-card-size";
-        fsize.textContent = `${formatBytes(parsed.size)} · ${parsed.mime}`;
-        meta.append(fname, fsize);
-
-        const dl = document.createElement("a");
-        dl.href = parsed.dataUrl;
-        dl.download = parsed.name;
-        dl.className = "ghost small-btn";
-        dl.style.textDecoration = "none";
-        dl.textContent = "Save";
-
-        card.append(icon, meta, dl);
-        attachWrap.appendChild(card);
-        bubble.appendChild(attachWrap);
-
-        if (parsed.caption) {
-          const cap = document.createElement("div");
-          cap.className = "msg-text";
-          cap.textContent = parsed.caption;
-          bubble.appendChild(cap);
-        }
-      } else {
-        const textDiv = document.createElement("div");
-        textDiv.className = "msg-text";
-        textDiv.textContent = m.body;
-        bubble.appendChild(textDiv);
-      }
-
-      const meta = document.createElement("div");
-      meta.className = "msg-meta";
-      meta.textContent = `${when(m.sent_at)} · TTL ${when(m.expires_at)}`;
-
-      li.append(bubble, meta);
-      list.appendChild(li);
+      if (existing.has(m.message_id)) continue;
+      // Exact matching first; fall back to the short form for members whose
+      // full code is not in the member list (e.g. a stale member cache).
+      const isOutgoing = selfContactCode && m.sender_code === selfContactCode;
+      const memberInfo =
+        cachedGroupMembers.find(
+          (gm) => (gm.contact_code && gm.contact_code === m.sender_code) || (isOutgoing && gm.is_self)
+        ) ||
+        cachedGroupMembers.find((gm) => gm.contact_code_short === m.sender_fingerprint);
+      list.appendChild(buildMessageRow(m, { isGroup: true, memberInfo }));
     }
 
-    const scrollBox = $("group-messages-scroll");
-    if (scrollBox) {
+    lastGroupMessagesSignature = signature;
+    if (wasPinned && scrollBox) {
       scrollBox.scrollTop = scrollBox.scrollHeight;
     }
   } catch (err) {
+    lastGroupMessagesSignature = "";
     list.innerHTML = "";
     const li = document.createElement("li");
     li.className = "empty";
@@ -1683,11 +1763,15 @@ async function sendGroupMessage() {
     });
     result.textContent = `✓ ${state.label ?? state}`;
     result.classList.add("ok");
+    // Only clear the composer after the backend accepted the send. A failure
+    // must leave the text and attachment in place so the user can retry
+    // without retyping.
     $("group-body").value = "";
     clearStagedGroupAttachment();
     await refreshGroupMessages(selectedGroupId);
   } catch (err) {
     showError(result, err);
+    // The composer keeps its content; the user edits or retries.
   } finally {
     groupSendInFlight = false;
     $("group-send").disabled = false;
@@ -1994,7 +2078,50 @@ function wireModals() {
         $("peer-label").value = parsed.label;
       }
     }
+    renderInvitePreview(e.target.value);
   });
+}
+
+/**
+ * Show a decoded preview of a pasted signed invite before the add commits.
+ *
+ * This is presentation only: the fields are read straight out of the invite's
+ * JSON payload, which is *not* verified here. The backend verifies the signature
+ * when the add is submitted, and the preview says so — a preview that looked
+ * authoritative would be lying about what has been checked.
+ */
+function renderInvitePreview(raw) {
+  const box = $("peer-invite-preview");
+  if (!box) return;
+
+  const text = (raw || "").trim();
+  const prefix = "tornel1:";
+  if (!text.startsWith(prefix)) {
+    box.hidden = true;
+    return;
+  }
+
+  try {
+    const invite = JSON.parse(text.slice(prefix.length));
+    const p = invite.payload ?? {};
+    const name = $("preview-name");
+    const code = $("preview-code");
+    const onion = $("preview-onion");
+    const note = $("preview-note");
+
+    if (name) name.textContent = p.name || "(no name in invite)";
+    if (code) code.textContent = p.contact_code ? `${p.contact_code.slice(0, 24)}…` : "missing";
+    if (onion) onion.textContent = p.onion ? `${p.onion.slice(0, 24)}….onion` : "missing";
+    if (note) {
+      note.textContent =
+        "Fields shown as written in the invite. The signature is verified when you save.";
+    }
+    box.hidden = false;
+  } catch {
+    // Not valid JSON yet — the user may still be pasting. Hide rather than
+    // show a half-decoded preview.
+    box.hidden = true;
+  }
 }
 
 async function refreshAll() {
@@ -2237,11 +2364,62 @@ async function refreshPrivacy() {
   }
 }
 
+/**
+ * Render the launch screen's persona cards and the identity modal's select.
+ *
+ * The launch screen is persona-first: each saved identity is a one-click card
+ * that opens that persona in its own window. The identity modal keeps the older
+ * select + create form because it is a management surface, not a sign-in one.
+ */
 async function refreshPersonas() {
   try {
     const personas = await invoke("list_personas");
-    for (const prefix of ["launch", "identity"]) {
-      const select = $(`${prefix}-personas`);
+
+    // Launch screen: clickable cards.
+    const list = $("launch-persona-list");
+    if (list) {
+      list.replaceChildren();
+      for (const persona of personas) {
+        const li = document.createElement("li");
+        li.tabIndex = 0;
+        li.setAttribute("role", "button");
+        li.setAttribute("aria-label", `Continue as ${persona.name}`);
+
+        const av = document.createElement("span");
+        av.className = "persona-avatar";
+        av.textContent = persona.name.trim().charAt(0).toUpperCase();
+
+        const name = document.createElement("span");
+        name.className = "persona-name";
+        name.textContent = persona.name;
+
+        li.append(av, name);
+        const open = async () => {
+          clearError($("launch-persona-result"));
+          try {
+            await invoke("open_persona", { id: persona.id });
+            $("launch-persona-result").textContent =
+              `Opened "${persona.name}" in its own window.`;
+          } catch (error) {
+            showError($("launch-persona-result"), error);
+          }
+        };
+        li.addEventListener("click", open);
+        li.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            open();
+          }
+        });
+        list.appendChild(li);
+      }
+      const empty = $("launch-persona-empty");
+      if (empty) empty.hidden = personas.length > 0;
+    }
+
+    // Identity modal: the management select.
+    const select = $("identity-personas");
+    if (select) {
       const previous = select.value;
       select.replaceChildren();
       const placeholder = document.createElement("option");
@@ -2255,7 +2433,7 @@ async function refreshPersonas() {
         select.appendChild(option);
       }
       if (personas.some((persona) => persona.id === previous)) select.value = previous;
-      $(`${prefix}-open-persona`).disabled = !select.value;
+      $("identity-open-persona").disabled = !select.value;
     }
   } catch (error) {
     showError($("launch-persona-result"), error);
@@ -2277,31 +2455,83 @@ function wirePrivacyControls() {
       }
     });
   }
-  for (const prefix of ["launch", "identity"]) {
-    const select = $(`${prefix}-personas`);
-    select.addEventListener("change", () => { $(`${prefix}-open-persona`).disabled = !select.value; });
-    for (const action of ["create", "open"]) {
-      const button = $(`${prefix}-${action}-persona`);
-      button.addEventListener("click", async () => {
-        button.disabled = true;
-        const result = $(`${prefix}-persona-result`);
-        clearError(result);
-        try {
-          let id = select.value;
-          if (action === "create") {
-            const persona = await invoke("create_persona", { name: $(`${prefix}-persona-name`).value });
-            id = persona.id;
-            $(`${prefix}-persona-name`).value = "";
-          }
-          await invoke("open_persona", { id });
-          result.textContent = "Persona opened in a separate window";
-          await refreshPersonas();
-        } catch (error) {
-          showError(result, error);
-        } finally {
-          button.disabled = action === "open" && !select.value;
-        }
-      });
-    }
+  // Identity modal: management select + create/open.
+  const identitySelect = $("identity-personas");
+  if (identitySelect) {
+    identitySelect.addEventListener("change", () => {
+      $("identity-open-persona").disabled = !identitySelect.value;
+    });
+    $("identity-open-persona")?.addEventListener("click", async () => {
+      const button = $("identity-open-persona");
+      button.disabled = true;
+      const result = $("identity-persona-result");
+      clearError(result);
+      try {
+        await invoke("open_persona", { id: identitySelect.value });
+        result.textContent = "Persona opened in a separate window";
+        await refreshPersonas();
+      } catch (error) {
+        showError(result, error);
+      } finally {
+        button.disabled = !identitySelect.value;
+      }
+    });
+    $("identity-create-persona")?.addEventListener("click", async () => {
+      const button = $("identity-create-persona");
+      button.disabled = true;
+      const result = $("identity-persona-result");
+      clearError(result);
+      try {
+        const persona = await invoke("create_persona", { name: $("identity-persona-name").value });
+        $("identity-persona-name").value = "";
+        await invoke("open_persona", { id: persona.id });
+        result.textContent = "Persona opened in a separate window";
+        await refreshPersonas();
+      } catch (error) {
+        showError(result, error);
+      } finally {
+        button.disabled = false;
+      }
+    });
   }
+
+  // Launch screen: "create a new identity" reveals the passphrase setup.
+  $("launch-new-identity")?.addEventListener("click", () => {
+    const setup = $("launch-setup");
+    const restore = $("launch-restore");
+    if (setup) setup.hidden = !setup.hidden;
+    if (restore) restore.hidden = true;
+    if (setup && !setup.hidden) $("setup-passphrase").focus();
+  });
+
+  // Escrow restore: read the artifact file, send its bytes as hex.
+  $("restore-submit")?.addEventListener("click", async () => {
+    const result = $("restore-result");
+    clearError(result);
+    const file = $("restore-file")?.files?.[0];
+    const passphrase = $("restore-passphrase").value;
+    if (!file) {
+      result.textContent = "Choose an escrow artifact file first.";
+      result.classList.add("error");
+      return;
+    }
+    if (!passphrase) {
+      result.textContent = "Enter the escrow passphrase.";
+      result.classList.add("error");
+      return;
+    }
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let hex = "";
+      for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+      result.textContent = "Verifying artifact (Argon2id)…";
+      await invoke("restore_identity", { artifact_hex: hex, passphrase });
+      $("restore-passphrase").value = "";
+      result.textContent =
+        "Identity restored. Relaunch the app to continue with it — the seed is now in this device's keychain.";
+      result.classList.add("ok");
+    } catch (error) {
+      showError(result, error);
+    }
+  });
 }

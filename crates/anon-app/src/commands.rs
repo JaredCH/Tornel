@@ -314,6 +314,123 @@ pub fn open_persona(state: State<'_, AppState>, id: String) -> Result<(), String
     crate::personas::open(state.data_dir(), &id)
 }
 
+/// Restore an identity from an escrow artifact.
+///
+/// # When this may run
+///
+/// Only while the app is locked and only when this install has **no** identity
+/// seed yet. Restoring over an existing seed would silently replace a contact
+/// code the user may have shared, so it is refused with an explanation rather
+/// than attempted. The launch screen only offers the restore section on a fresh
+/// install, but the backend enforces the rule itself — the webview is not
+/// trusted to decide this (`plan.md` §7.3).
+///
+/// # What happens
+///
+/// The artifact is decrypted with the supplied passphrase (Argon2id, AEAD — a
+/// wrong passphrase or a tampered artifact fails here), the recovered seed is
+/// written to the OS keychain, and the write is **read back and compared**
+/// before reporting success, exactly like the first-launch and migration paths
+/// in `identity_store`. The vault passphrase is chosen afterwards on the normal
+/// setup screen; the escrow passphrase is not reused for it.
+///
+/// The artifact bytes and the passphrase are zeroized after use. Neither is
+/// persisted anywhere.
+#[tauri::command(async, rename_all = "snake_case")]
+pub fn restore_identity(
+    state: State<'_, AppState>,
+    artifact_hex: String,
+    passphrase: String,
+) -> UiResult<RestoredIdentity> {
+    use zeroize::Zeroize;
+
+    // A blocked launch cannot reach the keychain, so restore cannot either.
+    if let Some(reason) = state.blocked_reason() {
+        return Err(UiError::from(CommandError::new(
+            "blocked",
+            reason.to_string(),
+        )));
+    }
+
+    let mut artifact = decode_hex(&artifact_hex).ok_or_else(|| {
+        UiError::from(CommandError::new(
+            "invalid_input",
+            "artifact is not valid hexadecimal",
+        ))
+    })?;
+    let mut passphrase = passphrase;
+
+    let result = (|| {
+        use crate::keychain::KeychainBackend as _;
+        let keychain = crate::keychain::OsKeychain::for_data_dir(state.data_dir());
+        if !keychain.available() {
+            return Err(CommandError::new(
+                "keychain_unavailable",
+                "the OS keychain is unavailable, so a restored seed could not be stored safely",
+            ));
+        }
+
+        // Refuse when an identity already exists. `load` distinguishes "no
+        // seed" from "keychain broken"; only the former may proceed.
+        match keychain.load() {
+            Ok(Some(_)) => {
+                return Err(CommandError::new(
+                    "identity_exists",
+                    "this device already has an identity; restoring would replace a contact \
+                     code you may have shared. Remove the existing identity first if you \
+                     really want to replace it.",
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(CommandError::new("keychain_error", error.to_string()));
+            }
+        }
+
+        let keys = anon_core::escrow::import(&artifact, &passphrase)
+            .map_err(|e| CommandError::new("restore_failed", e.to_string()))?;
+        let seed = keys.to_escrow_seed();
+
+        keychain
+            .store(&seed)
+            .map_err(|e| CommandError::new("keychain_error", e.to_string()))?;
+
+        // Verify the write landed before declaring success — the same rule the
+        // first-launch path follows. A keychain that accepts a write and hands
+        // back nothing must not be reported as a restore.
+        let readback = keychain
+            .load()
+            .map_err(|e| CommandError::new("keychain_error", e.to_string()))?
+            .ok_or_else(|| {
+                CommandError::new(
+                    "keychain_error",
+                    "the keychain accepted the restored seed but returned nothing on read-back",
+                )
+            })?;
+        if readback.as_ref() != seed.as_ref() {
+            return Err(CommandError::new(
+                "keychain_error",
+                "the keychain returned a different seed than it was given",
+            ));
+        }
+
+        let contact_code = anon_core::ContactCode::encode(&keys.public())
+            .map_err(|e| CommandError::new("internal", e.to_string()))?;
+        Ok(RestoredIdentity { contact_code })
+    })();
+
+    artifact.zeroize();
+    passphrase.zeroize();
+    result.map_err(UiError::from)
+}
+
+/// What a successful restore reports: the identity's public contact code, so
+/// the user can confirm it matches the one they escrowed.
+#[derive(Debug, Serialize)]
+pub struct RestoredIdentity {
+    pub contact_code: String,
+}
+
 #[tauri::command(async)]
 pub fn enable_restricted_discovery(state: State<'_, AppState>) -> UiResult<anon_ipc::PrivacyView> {
     state
@@ -837,6 +954,15 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Decode hex into bytes, rejecting odd lengths and non-hex characters.
+fn decode_hex(input: &str) -> Option<Vec<u8>> {
+    let trimmed = input.trim();
+    if !trimmed.len().is_multiple_of(2) {
+        return None;
+    }
+    hex::decode(trimmed).ok()
+}
+
 /// The commands this app registers.
 ///
 /// Kept as a single list so the surface is countable — `plan.md` §7.3 asks for "a
@@ -849,6 +975,7 @@ pub fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wr
         list_personas,
         create_persona,
         open_persona,
+        restore_identity,
         assess_strength,
         create_vault,
         unlock_vault,

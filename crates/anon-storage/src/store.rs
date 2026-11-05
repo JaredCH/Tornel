@@ -453,6 +453,67 @@ impl Store {
         Ok(())
     }
 
+    /// The user's own display name, persisted across launches.
+    ///
+    /// `None` when the user has never set one. Stored in `schema_meta` rather
+    /// than a dedicated column because it is a single scalar, like the privacy
+    /// configuration above it.
+    pub fn display_name(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'display_name_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Persist the user's own display name. `None` clears it.
+    pub fn set_display_name(&self, value: Option<&str>) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM schema_meta WHERE key = 'display_name_v1'", [])?;
+        if let Some(value) = value {
+            self.conn.lock().unwrap().execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('display_name_v1', ?1)",
+                [value],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record a frame id as seen, returning `false` if it was already recorded.
+    ///
+    /// This is the durable half of replay protection: the in-memory seen-set is
+    /// lost on restart, so a replayed frame was accepted again after a relaunch.
+    /// The id row expires with the message it protects, so the table never grows
+    /// past the retention ceiling.
+    pub fn observe_frame(&self, id: &[u8; 16], now: i64) -> Result<bool> {
+        let expires_at = self.expiry_for(now);
+        let n = self.conn.lock().unwrap().execute(
+            "INSERT INTO seen_frames (id, expires_at) VALUES (?1, ?2)
+             ON CONFLICT(id) DO NOTHING",
+            rusqlite::params![id, expires_at],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Forget a frame id that was observed but never actually sent.
+    ///
+    /// Mirrors `Outbox::forget`: a failed send attempt must not poison the id,
+    /// or every retry would look like a replay.
+    pub fn forget_frame(&self, id: &[u8; 16]) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM seen_frames WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     /// List known contacts, most recently added first.
     pub fn contacts(&self) -> Result<Vec<ContactRow>> {
         let conn = self.conn.lock().unwrap();
@@ -877,8 +938,27 @@ impl Store {
         sent_at: i64,
         plaintext: &[u8],
     ) -> Result<Vec<u8>> {
-        let now = self.now();
         let expires_at = self.expiry_for(sent_at);
+        self.insert_message_with_expiry(conversation, kind, sender, sent_at, expires_at, plaintext)
+    }
+
+    /// Insert an encrypted message with a caller-supplied expiry.
+    ///
+    /// The inbound path uses this instead of [`Store::insert_message_in`]: a
+    /// sender-controlled `sent_at` must not decide retention. Expiry is computed
+    /// from *our* receive time by the caller; `sent_at` is stored for display
+    /// and ordering only. The supplied expiry is still validated against the
+    /// current time, so an immortal row remains structurally impossible.
+    pub fn insert_message_with_expiry(
+        &self,
+        conversation: &[u8],
+        kind: ConversationKind,
+        sender: &[u8],
+        sent_at: i64,
+        expires_at: i64,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        let now = self.now();
 
         if expires_at <= now {
             return Err(StorageError::AlreadyExpired { expires_at, now });

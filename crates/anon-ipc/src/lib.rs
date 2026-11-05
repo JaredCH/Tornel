@@ -101,6 +101,7 @@ pub fn dto_inventory() -> Vec<&'static str> {
         // MessageView
         "message_id",
         "sender_fingerprint",
+        "sender_code",
         "sent_at",
         "expires_at",
         "delivery",

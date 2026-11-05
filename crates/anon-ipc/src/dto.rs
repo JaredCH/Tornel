@@ -110,6 +110,13 @@ pub struct MessageView {
     pub message_id: String,
     /// Sender's fingerprint, for attribution.
     pub sender_fingerprint: String,
+    /// The sender's full identifier (contact code), for exact matching.
+    ///
+    /// The short fingerprint is display-only; comparing against it can collide
+    /// between two contacts whose codes share a 12-character prefix. This field
+    /// carries the untruncated sender bytes so the UI can attribute messages
+    /// exactly. It is public identity material, not a secret.
+    pub sender_code: String,
     /// Send time, epoch seconds.
     pub sent_at: i64,
     /// This message's retention deadline.

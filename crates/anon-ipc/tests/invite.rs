@@ -169,7 +169,10 @@ fn a_tampered_invite_is_rejected() {
     let invite = alice.export_invite().expect("export");
     // Swap the onion for a different valid one; the signature covers it.
     let tampered = invite.replace(ONION_A, ONION_B);
-    assert_ne!(tampered, invite, "the test must actually change the payload");
+    assert_ne!(
+        tampered, invite,
+        "the test must actually change the payload"
+    );
 
     let error = bob
         .add_peer(&tampered, None)
@@ -185,8 +188,7 @@ fn export_invite_refuses_without_an_onion() {
     let dir = tempdir::TempDir::new("no-onion");
     let identity = anon_core::IdentityKeys::generate().expect("keygen");
     let store = open_store(&dir);
-    let transport: Arc<dyn AnonymityTransport> =
-        Arc::new(OfflineTransport::new("no Tor in tests"));
+    let transport: Arc<dyn AnonymityTransport> = Arc::new(OfflineTransport::new("no Tor in tests"));
     let backend = Backend::new(identity, transport, store);
 
     let error = backend

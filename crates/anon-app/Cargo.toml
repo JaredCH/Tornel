@@ -48,6 +48,7 @@ zeroize.workspace = true
 hkdf.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
+hex.workspace = true
 # The OS keychain for the identity seed (plan.md §2.3). The `v1` feature selects the
 # all-in-one facade that picks Windows Credential Manager / Keychain / Secret Service
 # automatically. Deliberately NOT the `cli` feature: its own docs say it "saddles an

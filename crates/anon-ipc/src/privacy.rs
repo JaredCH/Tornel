@@ -18,6 +18,14 @@ struct InvitePayload {
     contact_code: String,
     onion: String,
     discovery: String,
+    /// The sender's chosen display name, signed with the rest of the payload.
+    ///
+    /// Optional so invites minted before this field existed still verify. It is
+    /// *authenticated metadata*: the recipient sees the name the sender chose,
+    /// bound to the sender's key, but a name is still not identity (`plan.md`
+    /// §2) — two peers may claim the same name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -144,6 +152,9 @@ impl Backend {
             contact_code: self.contact_code().map_err(CommandError::from)?,
             onion: onion.as_str().into(),
             discovery: DiscoveryKey::for_identity(&self.identity).public_key(),
+            // The persisted name travels inside the signature, so the recipient
+            // knows it was chosen by the key holder and not altered in transit.
+            name: self.display_name.lock().unwrap().clone(),
         };
         let signature = hex_encode(&self.identity.sign(&transcript(&payload)?).to_bytes());
         Ok(format!(
@@ -228,9 +239,18 @@ impl Backend {
         if label.contains('|') {
             return Err(privacy_error("invalid peer label"));
         }
+        // When the user supplied no local label, adopt the name the sender
+        // signed into the invite. A locally chosen label always wins: it is the
+        // user's own alias for this contact, and `plan.md` §2 says names are
+        // local unless the peer signs and shares them.
+        let effective_label = if label.trim().is_empty() {
+            invite.payload.name.clone().unwrap_or_default()
+        } else {
+            label.trim().to_string()
+        };
         let saved = self.save_peer(
             &canonical,
-            Some(format!("{}|{}", label.trim(), invite.payload.onion)),
+            Some(format!("{}|{}", effective_label, invite.payload.onion)),
         )?;
         config.peers.insert(canonical, invite.payload);
         self.persist_privacy(&config)?;

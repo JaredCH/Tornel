@@ -35,6 +35,7 @@ pub const RETENTION_BOUND_TABLES: &[&str] = &[
     "mailbox_buffer",
     "send_queue",
     "consent_log",
+    "seen_frames",
 ];
 
 /// Tables that are metadata and deliberately have no retention bound.
@@ -221,6 +222,21 @@ CREATE TABLE IF NOT EXISTS consent_log (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_consent_expires_at ON consent_log (expires_at);
+
+-- Seen frame ids, for durable replay protection. The in-memory seen-set is
+-- lost on every restart, so a replayed frame was accepted again after a relaunch.
+-- This table persists the ids so a replay is rejected across restarts.
+--
+-- Retention-bound on purpose: an id row lives exactly as long as the message it
+-- protects. When the message is purged, the id may go too — a frame older than
+-- the retention ceiling cannot be replayed into a live conversation anyway,
+-- because its content would be rejected as expired on arrival.
+CREATE TABLE IF NOT EXISTS seen_frames (
+    id         BLOB PRIMARY KEY,
+    expires_at INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_seen_frames_expires_at ON seen_frames (expires_at);
 "#;
 
 /// The purge statements, one per retention-bound table (`plan.md` §6.1).
@@ -263,6 +279,10 @@ pub const PURGE_STATEMENTS: &[(&str, &str)] = &[
     (
         "consent_log",
         "DELETE FROM consent_log WHERE expires_at <= ?1",
+    ),
+    (
+        "seen_frames",
+        "DELETE FROM seen_frames WHERE expires_at <= ?1",
     ),
 ];
 

@@ -238,6 +238,8 @@ impl Backend {
         let consent = ConsentGate::new(&identity, 1024);
         let identity = Arc::new(identity);
         let messaging = Arc::new(MessagingService::new(transport.clone(), store.clone()));
+        // Read before `store` moves into `Self`.
+        let saved_name = store.display_name().unwrap_or(None);
 
         {
             let identity = Arc::clone(&identity);
@@ -254,7 +256,11 @@ impl Backend {
             store,
             messaging,
             consent,
-            display_name: Mutex::new(None),
+            // The name survives restarts: it is loaded from the store here and
+            // written through on every change. Before this, the name lived only
+            // in this mutex and vanished on every launch — which also meant the
+            // signed invite could not carry it.
+            display_name: Mutex::new(saved_name),
             escrow_exported: Mutex::new(false),
             pending_nonces: Mutex::new(HashMap::new()),
             pending_prompt: Mutex::new(None),
@@ -270,16 +276,27 @@ impl Backend {
 
     /// Set the local display name (`plan.md` §2: names are allowed but are not
     /// identity).
+    ///
+    /// The name is persisted in the store, so it survives a restart and can be
+    /// included in the signed invite. Validation happens before any write.
     pub fn set_display_name(&self, name: Option<String>) -> Result<()> {
-        if let Some(n) = &name {
-            if n.trim().is_empty() {
-                return Err(IpcError::EmptyField("display_name"));
+        let validated = match &name {
+            Some(n) => {
+                let t = n.trim();
+                if t.is_empty() {
+                    return Err(IpcError::EmptyField("display_name"));
+                }
+                if t.chars().count() > 64 {
+                    return Err(IpcError::FieldTooLong("display_name"));
+                }
+                Some(t.to_string())
             }
-            if n.chars().count() > 64 {
-                return Err(IpcError::FieldTooLong("display_name"));
-            }
-        }
-        *self.display_name.lock().unwrap() = name;
+            None => None,
+        };
+        self.store
+            .set_display_name(validated.as_deref())
+            .map_err(IpcError::Storage)?;
+        *self.display_name.lock().unwrap() = validated;
         Ok(())
     }
 
@@ -1215,6 +1232,8 @@ impl Backend {
             out.push(MessageView {
                 message_id: hex_encode(&row.id),
                 sender_fingerprint: short_fingerprint(&row.sender),
+                // The untruncated sender bytes, so the UI can attribute exactly.
+                sender_code: String::from_utf8_lossy(&row.sender).to_string(),
                 sent_at: row.sent_at,
                 expires_at: row.expires_at,
                 // Anything read back from local storage was, by definition, not
@@ -1472,13 +1491,34 @@ impl Backend {
             if let Ok((sent_at, body)) =
                 decode_and_verify_direct_envelope(&peer_pub, &conv, epoch, &envelope)
             {
+                // Durable replay check: the in-memory set is lost on restart, so
+                // the store's seen-frames table is the authority across relaunches.
+                let now = store.now();
                 if !messaging.outbox().observe(frame.id()) {
                     return Ok(false);
                 }
-                let now = store.now();
+                if !store
+                    .observe_frame(frame.id().as_bytes(), now)
+                    .unwrap_or(false)
+                {
+                    return Ok(false);
+                }
+                // Retention is computed from *our* receive time, not the
+                // sender's claim. The old code clamped a stale sent_at up to
+                // now-300s and used it for expiry, so replaying an old frame
+                // renewed its 90-day window on every attempt. The clamped value
+                // is now display/ordering only; expiry comes from `now`.
                 let effective_sent = sent_at.clamp(now.saturating_sub(300), now);
+                let expires_at = store.expiry_for(now);
                 store
-                    .insert_message(&conv, c.contact_code.as_bytes(), effective_sent, &body)
+                    .insert_message_with_expiry(
+                        &conv,
+                        anon_storage::ConversationKind::Direct,
+                        c.contact_code.as_bytes(),
+                        effective_sent,
+                        expires_at,
+                        &body,
+                    )
                     .map_err(CommandError::from)?;
                 return Ok(true);
             }
@@ -1497,6 +1537,13 @@ impl Backend {
                 if !messaging.outbox().observe(frame.id()) {
                     return Ok(false);
                 }
+                let now = store.now();
+                if !store
+                    .observe_frame(frame.id().as_bytes(), now)
+                    .unwrap_or(false)
+                {
+                    return Ok(false);
+                }
                 let Ok(conn) = store.open_secondary_connection() else {
                     return Ok(false);
                 };
@@ -1511,6 +1558,21 @@ impl Backend {
                         if let Ok((sent_at, sender_code, body)) = decode_group_envelope(&plaintext)
                         {
                             if body.starts_with(GROUP_ROLE_CONTROL_PREFIX) {
+                                // Role changes are authorized, not just
+                                // authenticated: the plaintext proves who *sent*
+                                // the frame, but only an owner or admin may
+                                // change a role. Without this check any group
+                                // member could promote themselves to owner by
+                                // sending one control frame.
+                                let sender_role = store
+                                    .group_role(&g.group_id, sender_code.trim())
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(|| "member".to_string())
+                                    .to_lowercase();
+                                if sender_role != "owner" && sender_role != "admin" {
+                                    return Ok(true);
+                                }
                                 let rest = String::from_utf8_lossy(
                                     &body[GROUP_ROLE_CONTROL_PREFIX.len()..],
                                 );
@@ -1524,18 +1586,22 @@ impl Backend {
                                 return Ok(true);
                             }
                             let now = store.now();
+                            // Same rule as direct messages: expiry from receive
+                            // time, clamped sent_at for display only.
                             let effective_sent = sent_at.clamp(now.saturating_sub(300), now);
+                            let expires_at = store.expiry_for(now);
                             let _ = store.ensure_conversation(
                                 &conv,
                                 anon_storage::ConversationKind::Group,
                                 &g.group_id,
                             );
                             store
-                                .insert_message_in(
+                                .insert_message_with_expiry(
                                     &conv,
                                     anon_storage::ConversationKind::Group,
                                     sender_code.as_bytes(),
                                     effective_sent,
+                                    expires_at,
                                     &body,
                                 )
                                 .map_err(CommandError::from)?;
@@ -1811,6 +1877,94 @@ mod tests {
         assert!(!bob.set_traffic_shaping(false).unwrap().traffic_shaping);
     }
 
+    #[test]
+    fn the_display_name_survives_a_restart() {
+        let store = test_store("name-persist");
+        let backend = Backend::new(
+            IdentityKeys::from_seed(&[85; 32]),
+            Arc::new(anon_transport::OfflineTransport::new("test")),
+            Arc::clone(&store),
+        );
+        assert_eq!(backend.identity_view().unwrap().display_name, None);
+        backend.set_display_name(Some("Jared".into())).unwrap();
+
+        // Simulate a restart: a new backend over the same store path.
+        let path = store.path().to_owned();
+        drop(backend);
+        drop(store);
+        let reopened = test_store_at(&path);
+        let backend2 = Backend::new(
+            IdentityKeys::from_seed(&[85; 32]),
+            Arc::new(anon_transport::OfflineTransport::new("test")),
+            reopened,
+        );
+        assert_eq!(
+            backend2.identity_view().unwrap().display_name,
+            Some("Jared".to_string())
+        );
+
+        // Clearing persists too.
+        backend2.set_display_name(None).unwrap();
+        assert_eq!(backend2.identity_view().unwrap().display_name, None);
+    }
+
+    #[test]
+    fn the_invite_carries_the_signed_name_and_the_recipient_adopts_it() {
+        let onion = anon_transport::OnionId::parse(
+            "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion",
+        )
+        .unwrap();
+        let alice = Backend::new(
+            IdentityKeys::from_seed(&[86; 32]),
+            Arc::new(MockTransport::tor_like(onion.clone())),
+            test_store("invite-name-alice"),
+        );
+        let bob = Backend::new(
+            IdentityKeys::from_seed(&[87; 32]),
+            Arc::new(MockTransport::tor_like(onion.clone())),
+            test_store("invite-name-bob"),
+        );
+        alice.initialize_privacy(true).unwrap();
+        bob.initialize_privacy(true).unwrap();
+        alice.set_display_name(Some("Alice P".into())).unwrap();
+
+        let invite = alice.export_invite().unwrap();
+        assert!(invite.contains("Alice P"), "the name travels in the invite");
+
+        // Tampering with the signed name must fail signature verification.
+        let tampered = invite.replace("Alice P", "Eve E");
+        assert!(bob.add_peer(&tampered, None).is_err());
+
+        // A local label wins over the signed name.
+        bob.add_peer(&invite, Some("My alias".into())).unwrap();
+        let contacts = bob.store.contacts().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(
+            contacts[0].display_name.as_deref(),
+            Some("My alias|vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion")
+        );
+
+        // With no local label, the signed name is adopted.
+        let carol = Backend::new(
+            IdentityKeys::from_seed(&[88; 32]),
+            Arc::new(MockTransport::tor_like(onion)),
+            test_store("invite-name-carol"),
+        );
+        carol.initialize_privacy(true).unwrap();
+        carol.add_peer(&invite, None).unwrap();
+        let contacts = carol.store.contacts().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert!(
+            contacts[0]
+                .display_name
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("Alice P|"),
+            "the signed name is adopted when no local label is given, got {:?}",
+            contacts[0].display_name
+        );
+    }
+
     use super::*;
     use anon_storage::{Argon2Params, Store, StoreConfig};
     use anon_transport::MockTransport;
@@ -1955,14 +2109,23 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
+        Arc::new(open_store_at(&p.join("test.db")))
+    }
+
+    /// Open a store at an existing path, as a restart would.
+    fn test_store_at(path: &std::path::Path) -> Arc<Store> {
+        Arc::new(open_store_at(path))
+    }
+
+    fn open_store_at(path: &std::path::Path) -> Store {
         let config = StoreConfig {
             params: Argon2Params::test_fast(),
             purge_on_open: false,
             vacuum_after_purge: false,
         };
-        let mut store = Store::open(&p.join("test.db"), "test-passphrase-1234", config).unwrap();
+        let mut store = Store::open(path, "test-passphrase-1234", config).unwrap();
         store.freeze_clock_at(1_700_000_000);
-        Arc::new(store)
+        store
     }
 
     #[test]
@@ -2076,6 +2239,129 @@ mod tests {
         assert_clean_attachment(&received.body);
         assert!(sent.iter().any(|message| message.body == received.body));
         assert_ne!(received.body, request.body);
+    }
+
+    #[test]
+    fn a_stale_sent_at_does_not_renew_retention() {
+        let onion_a =
+            OnionId::parse("vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion")
+                .unwrap();
+        let onion_b =
+            OnionId::parse("2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion")
+                .unwrap();
+        let trans_a = Arc::new(MockTransport::tor_like(onion_a));
+        let trans_b = Arc::new(MockTransport::tor_like(onion_b.clone()));
+        let alice = Backend::new(
+            IdentityKeys::generate().unwrap(),
+            trans_a.clone(),
+            test_store("stale-alice"),
+        );
+        let bob = Backend::new(
+            IdentityKeys::generate().unwrap(),
+            trans_b.clone(),
+            test_store("stale-bob"),
+        );
+        bob.add_peer(&alice.contact_code().unwrap(), None).unwrap();
+
+        // Alice sends a message whose envelope claims it was sent 30 days ago.
+        // The clamp keeps it at now-300s for display, but the old code derived
+        // expiry from that clamped value — so replaying the frame renewed the
+        // 90-day window each time. Expiry must come from receive time instead.
+        let stale_sent_at = bob.store.now() - 30 * 86_400;
+        let conv = direct_conversation_id(&alice.identity.public(), &bob.identity.public());
+        let key = derive_direct_key(&alice.identity, &bob.identity.public(), &conv, 0);
+        let body = encode_direct_envelope(
+            &alice.identity,
+            &conv,
+            0,
+            stale_sent_at,
+            b"old but replayed",
+        );
+        let frame = Frame::seal(&key, conv, 0, &body).unwrap();
+        trans_b.inject_inbound(frame.encode());
+
+        let conv_hex = hex_encode(&conv);
+        let msgs = bob.messages(&conv_hex).unwrap();
+        assert_eq!(msgs.len(), 1, "the frame is accepted once");
+
+        // The stored expiry is anchored to receive time, not the sender's claim:
+        // it must be ~90 days from NOW, not from 30 days ago.
+        let expected_floor = bob.store.expiry_for(bob.store.now()) - 86_400;
+        assert!(
+            msgs[0].expires_at >= expected_floor,
+            "expiry is anchored to receive time, got {} want >= {}",
+            msgs[0].expires_at,
+            expected_floor
+        );
+
+        // Replaying the same frame changes nothing — and, critically, does not
+        // push the expiry further out.
+        trans_b.inject_inbound(frame.encode());
+        let msgs_after = bob.messages(&conv_hex).unwrap();
+        assert_eq!(msgs_after.len(), 1, "the replay is rejected");
+        assert_eq!(
+            msgs_after[0].expires_at, msgs[0].expires_at,
+            "a replay does not renew retention"
+        );
+    }
+
+    #[test]
+    fn a_role_change_from_a_non_admin_is_ignored() {
+        let onion =
+            OnionId::parse("vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion")
+                .unwrap();
+        let transport = Arc::new(MockTransport::tor_like(onion.clone()));
+        let alice = Backend::new(
+            IdentityKeys::generate().unwrap(),
+            transport.clone(),
+            test_store("role-alice"),
+        );
+        let mallory = Backend::new(
+            IdentityKeys::generate().unwrap(),
+            transport.clone(),
+            test_store("role-mallory"),
+        );
+        let view = alice.create_group("team").unwrap();
+        let group_id = decode_group_id(&view.group_id).unwrap();
+
+        // Mallory is a member (joined via Welcome), not an admin.
+        let alice_provider = alice.group_provider().unwrap();
+        let mallory_provider = mallory.group_provider().unwrap();
+        let mut group = Group::load(&alice_provider, &group_id).unwrap().unwrap();
+        let key_package = Group::key_package(
+            &mallory_provider,
+            mallory.contact_code().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let added = group.add_members(&alice_provider, &[key_package]).unwrap();
+        Group::join_from_welcome(&mallory_provider, &added.welcome).unwrap();
+
+        // Mallory sends a role-control frame promoting himself to owner.
+        let conv = group_conversation_id(&group_id);
+        let key = derive_group_frame_key(&group_id, &conv, group.epoch());
+        let promote = format!(
+            "{}{}|owner",
+            String::from_utf8_lossy(GROUP_ROLE_CONTROL_PREFIX),
+            mallory.contact_code().unwrap()
+        );
+        let plaintext = encode_group_envelope(
+            alice.store.now(),
+            &mallory.contact_code().unwrap(),
+            promote.as_bytes(),
+        );
+        let frame = Frame::seal(&key, conv, group.epoch(), &plaintext).unwrap();
+        transport.inject_inbound(frame.encode());
+
+        // The promotion is ignored: Mallory's recorded role is unchanged.
+        let role = alice
+            .store
+            .group_role(&group_id, &mallory.contact_code().unwrap())
+            .unwrap();
+        assert_ne!(
+            role.as_deref(),
+            Some("owner"),
+            "a member cannot promote himself with a control frame"
+        );
     }
 
     #[test]
