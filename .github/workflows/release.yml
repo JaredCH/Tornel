@@ -334,6 +334,21 @@ jobs:
             service publishes (typically 20–60s after launch). Messages composed
             before then are queued on your device and retried automatically.
 
+            ## Windows notes
+
+            This build fixes the lag and semi-frequent crashes reported on
+            Windows. Three causes, all addressed:
+
+            - Every Tauri command ran on the UI thread, so each refresh tick
+              blocked the WebView2 message loop while it did SQLite reads or a
+              Tor send. Blocking commands now run on Tauri's thread pool.
+            - The four refresh timers could overlap and kept running while the
+              window was minimised. They now skip a tick when the previous one
+              has not finished, and pause while hidden.
+            - The sidebar and message list were torn down and rebuilt every
+              3 seconds even when nothing had changed. They now re-render only
+              when the data actually differs.
+
             ## Linux notes
 
             The `.deb` declares `libwebkit2gtk-4.1-0` and `libgtk-3-0`. The
