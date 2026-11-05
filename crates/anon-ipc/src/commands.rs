@@ -1129,34 +1129,42 @@ impl Backend {
         let contacts = self.store.contacts().map_err(CommandError::from)?;
         let my_pub = self.identity.public();
 
+        // Build the conversation-id -> label map once. The previous version decoded
+        // every contact's `ContactCode` inside the loop over conversations, so the
+        // work was O(conversations x contacts) with a curve25519 decode per
+        // comparison. The webview calls this every 3 s, which made it the single
+        // most expensive thing the app did while idle.
+        let mut labels: std::collections::HashMap<Vec<u8>, String> =
+            std::collections::HashMap::with_capacity(contacts.len());
+        for c in &contacts {
+            let Ok(code) = ContactCode::decode(&c.contact_code) else {
+                continue;
+            };
+            let peer_pub = code.public_identity();
+            let id = direct_conversation_id(&my_pub, &peer_pub);
+            let short = short_fingerprint(c.contact_code.as_bytes());
+            let label = match &c.display_name {
+                Some(name) => {
+                    let clean = name.split('|').next().unwrap_or("").trim();
+                    if clean.is_empty() {
+                        short
+                    } else {
+                        format!("{clean} ({short})")
+                    }
+                }
+                None => short,
+            };
+            labels.insert(id.as_slice().to_vec(), label);
+        }
+
         Ok(rows
             .into_iter()
             .filter(|r| r.kind == "direct")
             .map(|r| {
-                let mut label = conversation_label(&r.kind, &r.peer_or_group);
-                if r.kind == "direct" {
-                    for c in &contacts {
-                        if let Ok(code) = ContactCode::decode(&c.contact_code) {
-                            let peer_pub = code.public_identity();
-                            if direct_conversation_id(&my_pub, &peer_pub).as_slice()
-                                == r.id.as_slice()
-                            {
-                                let short = short_fingerprint(c.contact_code.as_bytes());
-                                if let Some(name) = &c.display_name {
-                                    let clean = name.split('|').next().unwrap_or("").trim();
-                                    if !clean.is_empty() {
-                                        label = format!("{clean} ({short})");
-                                    } else {
-                                        label = short;
-                                    }
-                                } else {
-                                    label = short;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
+                let label = labels
+                    .get(r.id.as_slice())
+                    .cloned()
+                    .unwrap_or_else(|| conversation_label(&r.kind, &r.peer_or_group));
                 ConversationView {
                     id: hex_encode(&r.id),
                     kind: r.kind.clone(),

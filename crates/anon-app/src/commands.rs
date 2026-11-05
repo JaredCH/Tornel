@@ -64,6 +64,9 @@ pub struct AppState {
     /// indistinguishable from one that crashed — which is exactly how an unavailable
     /// Linux credential store was reported.
     blocked_reason: Option<String>,
+    /// Bumped on every [`Self::install`], so the previous purge timer can tell it is
+    /// stale and exit rather than holding an `Arc<Store>` for another 24 hours.
+    install_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
@@ -75,6 +78,7 @@ impl AppState {
             vault: Arc::new(vault),
             data_dir,
             blocked_reason: None,
+            install_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -107,17 +111,33 @@ impl AppState {
     pub fn install(&self, backend: Backend) {
         let store = backend.store().clone();
         let transport = backend.messaging().transport().clone();
-        let mut slot = self.backend.lock().unwrap();
+        let mut slot = self.backend_slot();
         if let Some(old) = slot.take() {
             old.messaging().transport().shutdown();
         }
         *slot = Some(Arc::new(backend));
-        crate::spawn_purge_timer(store);
+        let mine = self
+            .install_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        crate::spawn_purge_timer(store, Arc::clone(&self.install_generation), mine);
         std::thread::spawn(move || {
             if let Err(error) = transport.start() {
                 eprintln!("anon: transport startup failed: {error}");
             }
         });
+    }
+
+    /// Lock the backend slot, recovering from a poisoned mutex.
+    ///
+    /// The release profile sets `panic = "abort"`, so a panic while the lock is held
+    /// takes the process down rather than poisoning it. In debug and test builds it
+    /// does poison, and `unwrap()` there would turn one failed command into a
+    /// permanently unusable app: every later command would panic on the same lock.
+    /// The guarded value is an `Option<Arc<Backend>>`, which a panic cannot leave
+    /// half-written, so recovering the inner value is sound.
+    fn backend_slot(&self) -> std::sync::MutexGuard<'_, Option<Arc<Backend>>> {
+        self.backend.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The backend, or a `locked` error.
@@ -126,9 +146,7 @@ impl AppState {
     /// your passphrase" instead of dying. Every command that touches user data calls
     /// this.
     pub fn backend(&self) -> UiResult<Arc<Backend>> {
-        self.backend
-            .lock()
-            .unwrap()
+        self.backend_slot()
             .clone()
             .ok_or_else(|| UiError::from(CommandError::new("locked", "the app is locked")))
     }
@@ -145,7 +163,15 @@ impl AppState {
 
     /// Whether a backend is installed.
     pub fn is_unlocked(&self) -> bool {
-        self.backend.lock().unwrap().is_some()
+        self.backend_slot().is_some()
+    }
+
+    /// Serialise vault setup/unlock/migrate, recovering from a poisoned mutex.
+    ///
+    /// Same reasoning as [`Self::backend_slot`]: the guarded value is `()`, so there is
+    /// no partially-written state to distrust.
+    fn unlock_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.unlock_lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -187,7 +213,7 @@ type UiResult<T> = std::result::Result<T, UiError>;
 // ---------------------------------------------------------------------------
 
 /// The identity panel's data.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn identity_view(state: State<'_, AppState>) -> UiResult<IdentityView> {
     state.backend()?.identity_view().map_err(UiError::from)
 }
@@ -196,7 +222,7 @@ pub fn identity_view(state: State<'_, AppState>) -> UiResult<IdentityView> {
 ///
 /// Names are allowed but are not identity (`plan.md` §2): this changes a label,
 /// never a key.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn set_display_name(state: State<'_, AppState>, name: Option<String>) -> UiResult<()> {
     state
         .backend()?
@@ -205,7 +231,7 @@ pub fn set_display_name(state: State<'_, AppState>, name: Option<String>) -> UiR
 }
 
 /// Record that the user completed the escrow export flow.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn note_escrow_exported(state: State<'_, AppState>) -> UiResult<()> {
     state.backend()?.note_escrow_exported();
     Ok(())
@@ -223,7 +249,7 @@ pub fn note_escrow_exported(state: State<'_, AppState>) -> UiResult<()> {
 ///
 /// It is hex rather than raw bytes because Tauri's IPC is JSON; the frontend
 /// decodes it into a `Blob` and hands it to the user's download flow.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn export_escrow(state: State<'_, AppState>, passphrase: String) -> UiResult<String> {
     let artifact = state
         .backend()?
@@ -237,12 +263,12 @@ pub fn export_escrow(state: State<'_, AppState>, passphrase: String) -> UiResult
 // ---------------------------------------------------------------------------
 
 /// Transport status for the header and the "cannot send" banner.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn transport_view(state: State<'_, AppState>) -> UiResult<TransportView> {
     Ok(state.backend()?.transport_view())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn privacy_view(state: State<'_, AppState>) -> UiResult<anon_ipc::PrivacyView> {
     state.backend()?.privacy_view().map_err(UiError::from)
 }
@@ -251,13 +277,13 @@ pub fn privacy_view(state: State<'_, AppState>) -> UiResult<anon_ipc::PrivacyVie
 ///
 /// Called on a timer by the webview, so a message queued while the peer was
 /// offline goes out on its own once the transport is usable again.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn drain_send_queue(state: State<'_, AppState>) -> UiResult<usize> {
     state.backend()?.drain_send_queue().map_err(UiError::from)
 }
 
 /// Frames still waiting to go out for one conversation.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn queued_messages(
     state: State<'_, AppState>,
     conversation_id: String,
@@ -268,14 +294,14 @@ pub fn queued_messages(
         .map_err(UiError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_personas(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::personas::PersonaView>, String> {
     crate::personas::list(state.data_dir())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_persona(
     state: State<'_, AppState>,
     name: String,
@@ -283,12 +309,12 @@ pub fn create_persona(
     crate::personas::create(state.data_dir(), &name)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_persona(state: State<'_, AppState>, id: String) -> Result<(), String> {
     crate::personas::open(state.data_dir(), &id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn enable_restricted_discovery(state: State<'_, AppState>) -> UiResult<anon_ipc::PrivacyView> {
     state
         .backend()?
@@ -296,12 +322,12 @@ pub fn enable_restricted_discovery(state: State<'_, AppState>) -> UiResult<anon_
         .map_err(UiError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn export_invite(state: State<'_, AppState>) -> UiResult<String> {
     state.backend()?.export_invite().map_err(UiError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_traffic_shaping(
     state: State<'_, AppState>,
     enabled: bool,
@@ -317,13 +343,13 @@ pub fn set_traffic_shaping(
 // ---------------------------------------------------------------------------
 
 /// Conversations for the sidebar.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn conversations(state: State<'_, AppState>) -> UiResult<Vec<ConversationView>> {
     state.backend()?.conversations().map_err(UiError::from)
 }
 
 /// Messages in one conversation.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn messages(state: State<'_, AppState>, conversation_id: String) -> UiResult<Vec<MessageView>> {
     state
         .backend()?
@@ -332,7 +358,7 @@ pub fn messages(state: State<'_, AppState>, conversation_id: String) -> UiResult
 }
 
 /// Known peers.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn peers(state: State<'_, AppState>) -> UiResult<Vec<PeerView>> {
     state.backend()?.peers().map_err(UiError::from)
 }
@@ -344,7 +370,7 @@ pub struct AddPeerResult {
     pub conversation_id: String,
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn add_peer(
     state: State<'_, AppState>,
     contact_code: String,
@@ -418,7 +444,7 @@ pub async fn send_message(
 // ---------------------------------------------------------------------------
 
 /// The outstanding consent prompt, if any.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn pending_consent(state: State<'_, AppState>) -> UiResult<Option<ConsentPrompt>> {
     Ok(state.backend()?.pending_consent())
 }
@@ -428,7 +454,7 @@ pub fn pending_consent(state: State<'_, AppState>) -> UiResult<Option<ConsentPro
 /// The webview supplies only the proposal id, the nonce handle it was given, and a
 /// boolean. It cannot influence *what* it is approving — only whether to approve
 /// (`plan.md` §5.2).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn submit_consent(
     state: State<'_, AppState>,
     submission: ConsentSubmission,
@@ -446,7 +472,7 @@ pub fn submit_consent(
 /// Exposed so the shell can demonstrate the consent flow without a group UI. A
 /// production build would call this from the rotation scheduler in Rust, not from
 /// the webview — the webview should never *initiate* a rotation, only approve one.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn draft_rotation(
     state: State<'_, AppState>,
     group_id: String,
@@ -484,19 +510,19 @@ pub fn draft_rotation(
 // rule.
 
 /// Every group this device belongs to, for the sidebar.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn groups(state: State<'_, AppState>) -> UiResult<Vec<GroupView>> {
     state.backend()?.groups().map_err(UiError::from)
 }
 
 /// Create a group with the local user as its only member.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn create_group(state: State<'_, AppState>, name: String) -> UiResult<GroupView> {
     state.backend()?.create_group(&name).map_err(UiError::from)
 }
 
 /// Generate a single-use MLS KeyPackage (hex) so a peer can add this user to a group.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn generate_key_package(state: State<'_, AppState>) -> UiResult<String> {
     state
         .backend()?
@@ -505,7 +531,7 @@ pub fn generate_key_package(state: State<'_, AppState>) -> UiResult<String> {
 }
 
 /// Join an MLS group from a hex-encoded Welcome message.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn join_group(
     state: State<'_, AppState>,
     name: String,
@@ -518,7 +544,7 @@ pub fn join_group(
 }
 
 /// The members of one group.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn group_members(
     state: State<'_, AppState>,
     group_id: String,
@@ -533,7 +559,7 @@ pub fn group_members(
 ///
 /// The Welcome is returned rather than stored: the inviter's job is to hand it over
 /// once, and persisting it would leave a second copy of group-joining material on disk.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn add_member(
     state: State<'_, AppState>,
     group_id: String,
@@ -546,7 +572,7 @@ pub fn add_member(
 }
 
 /// Remove a member by leaf index.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn remove_member(
     state: State<'_, AppState>,
     group_id: String,
@@ -559,7 +585,7 @@ pub fn remove_member(
 }
 
 /// Set a member's role (`owner`, `admin`, `moderator`, `member`) in a group.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn set_member_role(
     state: State<'_, AppState>,
     group_id: String,
@@ -622,7 +648,7 @@ pub async fn send_group_message(
 /// What the launch screen should render.
 ///
 /// Callable while locked. The webview calls this first and routes to setup or unlock.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn vault_view(state: State<'_, AppState>) -> UiResult<VaultView> {
     let vault = state.vault();
     let vault_state = vault.state();
@@ -662,7 +688,7 @@ pub fn vault_view(state: State<'_, AppState>) -> UiResult<VaultView> {
 /// Callable while locked. Takes the candidate as an argument and returns only facts about
 /// it — never the candidate itself. The webview already has the value it typed, so
 /// returning it would add nothing but a second copy in the IPC log.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn assess_strength(state: State<'_, AppState>, candidate: String) -> UiResult<StrengthView> {
     let vault = state.vault();
     let assessment = vault.assess(&candidate);
@@ -683,13 +709,13 @@ pub fn assess_strength(state: State<'_, AppState>, candidate: String) -> UiResul
 ///
 /// On success the backend is installed and the app is unlocked — the user should not have
 /// to type the passphrase twice in a row.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn create_vault(
     state: State<'_, AppState>,
     passphrase: String,
     confirm: String,
 ) -> UiResult<VaultView> {
-    let guard = state.unlock_lock.lock().unwrap();
+    let guard = state.unlock_guard();
     if state.is_unlocked() {
         drop(guard);
         return vault_view(state);
@@ -720,9 +746,9 @@ pub fn create_vault(
 /// A wrong passphrase returns the `wrong_passphrase` code so the screen can say "check it
 /// and try again" rather than "storage error" — those mean very different things to a
 /// user, and only one of them is worth retrying.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn unlock_vault(state: State<'_, AppState>, passphrase: String) -> UiResult<VaultView> {
-    let guard = state.unlock_lock.lock().unwrap();
+    let guard = state.unlock_guard();
     if state.is_unlocked() {
         drop(guard);
         return vault_view(state);
@@ -750,13 +776,13 @@ pub fn unlock_vault(state: State<'_, AppState>, passphrase: String) -> UiResult<
 /// The user chooses the new passphrase; the app reads the machine-held one itself, uses it
 /// as the old key, and deletes it. See [`crate::vault::Vault::migrate`] for why the rekey
 /// runs before the deletion.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 pub fn migrate_vault(
     state: State<'_, AppState>,
     passphrase: String,
     confirm: String,
 ) -> UiResult<VaultView> {
-    let guard = state.unlock_lock.lock().unwrap();
+    let guard = state.unlock_guard();
     if state.is_unlocked() {
         drop(guard);
         return vault_view(state);

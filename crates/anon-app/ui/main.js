@@ -363,6 +363,11 @@ let cachedPeers = [];
 let cachedConversations = [];
 let cachedGroups = [];
 let cachedGroupMembers = [];
+// Signature of the last rendered message list, so an unchanged conversation is not
+// torn down and rebuilt on every refresh tick.
+let lastMessagesSignature = "";
+// Same idea for the sidebar: the 3 s tick rebuilt it even when nothing changed.
+let lastConversationsSignature = "";
 let selectedConversationId = null;
 let selectedGroupId = null;
 let activeSidebarFilter = "all";
@@ -771,6 +776,8 @@ async function addPeer() {
 async function selectConversation(conversationId, labelText, explicitOnion) {
   selectedConversationId = conversationId;
   selectedGroupId = null;
+  // Force a rebuild: the signature belongs to the conversation we are leaving.
+  lastMessagesSignature = "";
 
   $("chat-empty-state").hidden = true;
   $("group-detail").hidden = true;
@@ -918,6 +925,14 @@ async function refreshConversationMessages(conversationId) {
   if (!list) return;
   try {
     const items = await invoke("messages", { conversation_id: conversationId });
+    // Rebuilding the whole list every 3 s discarded the user's scroll position and
+    // forced a full layout pass on every tick. Skip the rebuild when nothing changed.
+    const signature = `${conversationId}\u0000${items.length}\u0000${items
+      .map((m) => `${m.sent_at}:${m.body.length}`)
+      .join(",")}`;
+    if (signature === lastMessagesSignature) return;
+    lastMessagesSignature = signature;
+
     list.innerHTML = "";
     if (!items.length) {
       const li = document.createElement("li");
@@ -1002,6 +1017,10 @@ async function refreshConversationMessages(conversationId) {
       scrollBox.scrollTop = scrollBox.scrollHeight;
     }
   } catch (err) {
+    // The list now holds an error row, not the rendered data. Clear the signature so
+    // the next successful tick rebuilds instead of matching the stale one and leaving
+    // the error on screen.
+    lastMessagesSignature = "";
     list.innerHTML = "";
     const li = document.createElement("li");
     li.className = "empty";
@@ -1013,12 +1032,21 @@ async function refreshConversationMessages(conversationId) {
 function renderConversationsList() {
   const list = $("conversations");
   if (!list) return;
-  list.innerHTML = "";
 
   const q = sidebarSearchQuery.toLowerCase();
   const filtered = cachedConversations.filter(
     (c) => !q || c.label.toLowerCase().includes(q) || c.id.toLowerCase().includes(q)
   );
+
+  // The 3 s refresh called this unconditionally, so every tick destroyed and
+  // rebuilt the sidebar even when nothing had changed. Compare first.
+  const signature = `${selectedConversationId}\u0000${q}\u0000${cachedPeers.length}\u0000${filtered
+    .map((c) => `${c.id}:${c.label}:${c.message_count}:${c.expires_at}`)
+    .join(",")}`;
+  if (signature === lastConversationsSignature) return;
+  lastConversationsSignature = signature;
+
+  list.innerHTML = "";
 
   if (!filtered.length && !cachedPeers.length) {
     const li = document.createElement("li");
@@ -1077,6 +1105,9 @@ async function refreshConversations() {
       await refreshConversationMessages(selectedConversationId);
     }
   } catch (err) {
+    // Same reasoning as the message list: the sidebar now shows an error row, so the
+    // signature must not match the data that was there before.
+    lastConversationsSignature = "";
     const list = $("conversations");
     if (list) {
       list.innerHTML = "";
@@ -1996,19 +2027,45 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 });
 
+/**
+ * Run `task` on an interval, but never overlap two runs and never run while the
+ * window is hidden.
+ *
+ * Overlapping runs were the real cost of the old loops: a slow pass (Tor
+ * bootstrap, a large conversation) was still in flight when the next tick fired,
+ * so the queue of pending invokes grew without bound and the UI fell further
+ * behind on every tick. Skipping while hidden matters because a minimised window
+ * was still issuing four IPC round-trips a second against SQLite.
+ */
+function every(ms, task) {
+  let running = false;
+  return setInterval(async () => {
+    if (running || document.hidden) return;
+    running = true;
+    try {
+      await task();
+    } catch {
+      // Each task reports its own errors; a throw here must not stop the loop.
+    } finally {
+      running = false;
+    }
+  }, ms);
+}
+
 function startRefreshLoops() {
-  setInterval(refreshTransport, 2000);
-  setInterval(async () => {
+  every(2000, refreshTransport);
+  every(3000, async () => {
     await refreshConversations();
     if (selectedGroupId) {
       await refreshGroupMembers(selectedGroupId);
       await refreshGroupMessages(selectedGroupId);
     }
-  }, 3000);
-  setInterval(refreshConsent, 3000);
+  });
+  // Offset from the conversation loop so the two do not land in the same tick.
+  setTimeout(() => every(3000, refreshConsent), 1000);
   // Retry queued frames. The backend applies its own per-frame backoff, so a
   // short interval here is cheap: most passes find nothing due and return.
-  setInterval(drainSendQueue, 5000);
+  setTimeout(() => every(5000, drainSendQueue), 2000);
 }
 
 /**

@@ -625,6 +625,48 @@ unavailable, the Messages tab renders, and pressing Send surfaces the backend's
 validation error (`[invalid_input] a required field was empty: conversation_id`)
 with its stable code.
 
+### Why the Windows build lagged and crashed
+
+Windows was the only platform where the app felt sluggish and occasionally died.
+Three separate causes, all fixed in 0.1.5:
+
+**1. Every command ran on the UI thread.** Tauri v2 executes a synchronous
+`#[tauri::command]` on the main thread — the same thread that pumps the WebView2
+message loop. 34 of the 36 commands were synchronous, including every command the
+webview polls on a timer, so each tick did SQLite reads, Argon2id work, or a Tor
+send *while the window could not repaint*. WebView2 (Chromium) is far less
+forgiving of a stalled main thread than WebKitGTK, which is why Linux and macOS
+tolerated it. All blocking commands now carry `#[tauri::command(async)]`, which
+runs them on Tauri's thread pool instead.
+
+**2. The refresh loops overlapped and never paused.** Four intervals (2 s, 3 s,
+3 s, 5 s) each issued IPC calls with no guard against a previous pass still being
+in flight, so a slow pass — Tor bootstrap, a large conversation — let the queue of
+pending invokes grow without bound. They also kept running while the window was
+minimised. The loops now skip a tick when the previous one has not finished and
+skip entirely while `document.hidden`.
+
+**3. The UI rebuilt itself on every tick.** `renderConversationsList` and
+`refreshConversationMessages` cleared `innerHTML` and recreated every row and
+bubble every 3 seconds, discarding scroll position and forcing a full layout pass
+even when nothing had changed. Both now compare a cheap signature first and return
+early when the data is identical.
+
+Two smaller fixes came out of the same investigation:
+
+- `Backend::conversations()` decoded every contact's `ContactCode` inside the loop
+  over conversations — O(conversations × contacts) with a curve25519 decode per
+  comparison, on a 3-second timer. It now builds the id→label map once.
+- `AppState::install` spawned a new 24-hour purge thread on every unlock and never
+  stopped the old one. Each stale thread held an `Arc<Store>`, which on Windows
+  keeps the database file locked. A generation counter now retires the previous
+  thread.
+
+The release profile sets `panic = "abort"`, so any panic is a hard process exit
+with no message. The three production `Mutex::lock().unwrap()` sites are now
+poison-tolerant, so a panic in one command cannot turn into a permanently
+unusable app in debug and test builds.
+
 ### The app starts locked, and that is the point
 
 The user-held passphrase changed startup structurally. The app no longer opens its

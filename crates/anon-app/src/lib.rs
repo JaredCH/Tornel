@@ -260,9 +260,26 @@ pub fn build_transport(data_dir: &std::path::Path) -> Arc<dyn AnonymityTransport
 /// Called from [`commands::AppState::install`] rather than at startup, because the store
 /// does not exist until the user unlocks. The store's own `purge_on_open` handles the
 /// launch-time purge; this timer covers the 24h cadence after that.
-pub(crate) fn spawn_purge_timer(store: Arc<Store>) {
+///
+/// `generation` is the install counter and `mine` is the value this thread was started
+/// with. A re-unlock installs a new backend and bumps the counter, so the previous
+/// thread notices it is stale and exits instead of sleeping for another 24 hours while
+/// holding an `Arc<Store>` — which on Windows keeps the database file locked and makes
+/// the next unlock fail.
+pub(crate) fn spawn_purge_timer(
+    store: Arc<Store>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    mine: u64,
+) {
+    use std::sync::atomic::Ordering;
     std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(PURGE_INTERVAL_SECS));
+        // Sleep in short slices so a stale thread exits promptly rather than after a day.
+        for _ in 0..PURGE_INTERVAL_SECS {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if generation.load(Ordering::Relaxed) != mine {
+                return;
+            }
+        }
         let now = store.now();
         match store.purge(now) {
             Ok(report) if !report.is_empty() => {
