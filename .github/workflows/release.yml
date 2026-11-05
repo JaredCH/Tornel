@@ -425,6 +425,12 @@ jobs:
 
             ## Android notes
 
+            v0.1.7 failed to install on Android 15+ devices running 16 KB page-size
+            kernels ("package appears to be invalid"): the 32-bit native libraries
+            were linked with 4 KB ELF segment alignment. All four ABIs are now
+            linked with 16 KB alignment, so the APK installs on both 4 KB and
+            16 KB page-size devices.
+
             The APK is signed with the project release key, so it installs directly.
             Android will still warn that the app comes from an unknown source — that
             is expected for any app not distributed through Play. Allow installs from

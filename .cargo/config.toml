@@ -15,3 +15,23 @@ debug = false
 # ~2.6 MB of .pdb each (serde_derive, zeroize_derive, thiserror_impl, ...).
 [profile.dev.build-override]
 debug = false
+
+# 16 KB page-size compatibility (Android 15+).
+#
+# NDK r27 links 64-bit Android targets with 16 KB ELF segment alignment by
+# default, but 32-bit targets (armeabi-v7a, x86) still default to 4 KB. Devices
+# running 16 KB page-size kernels refuse to install APKs whose native libraries
+# are not 16 KB-aligned, reporting "package appears to be invalid" — the failure
+# seen with v0.1.7. Setting max-page-size explicitly on every Android target
+# makes all four ABIs 16 KB-compatible regardless of NDK defaults.
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.i686-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
