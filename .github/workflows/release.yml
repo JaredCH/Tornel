@@ -218,24 +218,85 @@ jobs:
           fi
         working-directory: crates/anon-app
 
-      # The generated Gradle project has no release signing config, so this produces an
-      # *unsigned* release APK. That is deliberate rather than an oversight: signing needs
-      # a keystore, and a keystore is a long-lived secret that must not be invented by CI.
-      # To ship a signed build, add a `signingConfigs.release` block to
-      # `gen/android/app/build.gradle.kts` (see the Tauri Android signing guide) and supply
-      # the keystore through repository secrets. Until then the artifact is installable
-      # only after `apksigner` signs it, which the README says.
+      # The generated Gradle project has no release signing config, so the build itself
+      # produces an *unsigned* release APK. Signing happens in the next step with
+      # `apksigner` rather than through a `signingConfigs.release` block, because the
+      # Gradle project is generated (gitignored) and patching it on every run is more
+      # fragile than signing the finished artifact.
       - name: Build APK
         run: npx --yes @tauri-apps/cli@^2 android build --apk --ci
         working-directory: crates/anon-app
+
+      # An unsigned APK cannot be installed at all: Android rejects it with
+      # "Package ... has no signatures that match those in shared user" or, more
+      # commonly, a bare "signature not valid" from the package installer. v0.1.4 and
+      # v0.1.5 shipped unsigned and were therefore uninstallable, which is the bug this
+      # step fixes.
+      #
+      # The keystore is a long-lived secret and must never be committed. It arrives as a
+      # base64 secret, is written to a path outside the workspace, and is removed in an
+      # `always()` step so it cannot leak into a cached directory or an artifact.
+      #
+      # v1 (JAR) signing is disabled deliberately: `minSdkVersion` is 24, and v2 was
+      # introduced in Android 7.0 (API 24), so v2+v3 covers every supported device.
+      - name: Sign APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 is not set. An unsigned APK cannot be installed."
+            exit 1
+          fi
+
+          KEYSTORE="$RUNNER_TEMP/tornel-release.jks"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE"
+
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/36.1.0"
+          if [ ! -d "$BUILD_TOOLS" ]; then
+            BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          fi
+
+          VERSION="$(grep -m1 '^version' crates/anon-app/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          UNSIGNED="$(find crates/anon-app/gen/android/app/build/outputs/apk -name '*.apk' | head -1)"
+          if [ -z "$UNSIGNED" ]; then
+            echo "::error::no APK produced by the build"
+            exit 1
+          fi
+          echo "signing $UNSIGNED as version $VERSION"
+
+          mkdir -p target/release/apk
+          ALIGNED="$RUNNER_TEMP/aligned.apk"
+          SIGNED="target/release/apk/anon_${VERSION}_universal.apk"
+
+          "$BUILD_TOOLS/zipalign" -p -f 4 "$UNSIGNED" "$ALIGNED"
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            --v1-signing-enabled false \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out "$SIGNED" \
+            "$ALIGNED"
+
+          # Fail the job rather than publish an artifact that will not install.
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$SIGNED"
+          rm -f "$KEYSTORE" "$ALIGNED"
+
+      - name: Remove keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/tornel-release.jks" "$RUNNER_TEMP/aligned.apk"
 
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
           name: anon-android
-          path: |
-            target/release/apk/*.apk
-            crates/anon-app/gen/android/app/build/outputs/apk/**/*.apk
+          path: target/release/apk/*.apk
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -319,7 +380,7 @@ jobs:
             | Windows (x64) | `anon_*_x64-setup.exe` (NSIS) |
             | Debian / Ubuntu (x64) | `anon_*_amd64.deb` |
             | Any Linux (x64) | `anon_*_amd64.AppImage` |
-            | Android (arm64 + x86_64) | `app-universal-release-unsigned.apk` |
+            | Android (arm64 + x86_64) | `anon_*_universal.apk` (signed) |
 
             Verify a download against `SHA256SUMS.txt` before running it.
 
@@ -348,6 +409,17 @@ jobs:
             - The sidebar and message list were torn down and rebuilt every
               3 seconds even when nothing had changed. They now re-render only
               when the data actually differs.
+
+            ## Android notes
+
+            The APK is signed with the project release key, so it installs directly.
+            Android will still warn that the app comes from an unknown source — that
+            is expected for any app not distributed through Play. Allow installs from
+            your browser or file manager when prompted.
+
+            The signature is what lets a future version upgrade this one in place.
+            Installing a build signed with a different key requires uninstalling
+            first, which deletes the local database.
 
             ## Linux notes
 

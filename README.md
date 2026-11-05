@@ -490,12 +490,44 @@ Four Android-specific notes:
   `keyring-core` itself. The seed is still never written to a plaintext file, and an
   unavailable Keystore still blocks the app rather than degrading.
 
-The release workflow produces an **unsigned** APK named
-`app-universal-release-unsigned.apk`, because the generated Gradle project has no release
-signing config and a keystore is a long-lived secret that CI must not invent. To distribute
-it, add a `signingConfigs.release` block to `gen/android/app/build.gradle.kts` and supply
-the keystore through repository secrets; until then, sign the artifact yourself with
-`apksigner` before installing.
+The release workflow produces a **signed** APK named `anon_<version>_universal.apk`.
+
+Signing is not optional. An unsigned APK cannot be installed at all — Android's package
+installer rejects it, which is exactly what happened to the v0.1.4 and v0.1.5 artifacts
+(`app-universal-release-unsigned.apk`). The build itself still produces an unsigned APK,
+because the generated Gradle project has no release signing config; the workflow then
+aligns and signs it with `apksigner` and verifies the result before uploading, so a
+signing failure fails the job rather than publishing an uninstallable file.
+
+The keystore is a long-lived secret and is never committed. It is supplied to CI as four
+repository secrets:
+
+| Secret | Value |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | `base64 -w0 tornel-release.jks` |
+| `ANDROID_KEYSTORE_PASSWORD` | the keystore password |
+| `ANDROID_KEY_ALIAS` | `tornel` |
+| `ANDROID_KEY_PASSWORD` | the key password |
+
+The workflow writes the keystore to `$RUNNER_TEMP` (outside the workspace), signs, and
+deletes it in an `always()` step so it cannot reach a cache or an artifact.
+
+**The keystore determines the app's identity.** Every future release must be signed with
+the same one, or Android refuses to upgrade an installed copy and the user has to
+uninstall first — which deletes their local database. Back it up somewhere durable.
+
+To sign a local build by hand:
+
+```bash
+zipalign -p -f 4 app-universal-release-unsigned.apk aligned.apk
+apksigner sign --ks tornel-release.jks --ks-key-alias tornel \
+  --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled true \
+  --out anon-universal.apk aligned.apk
+apksigner verify --verbose --print-certs anon-universal.apk
+```
+
+v1 (JAR) signing is disabled deliberately: `minSdkVersion` is 24, and APK Signature
+Scheme v2 arrived in Android 7.0 (API 24), so v2+v3 covers every supported device.
 
 ### Releasing
 
