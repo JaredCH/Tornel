@@ -319,7 +319,7 @@ jobs:
             | Windows (x64) | `anon_*_x64-setup.exe` (NSIS) |
             | Debian / Ubuntu (x64) | `anon_*_amd64.deb` |
             | Any Linux (x64) | `anon_*_amd64.AppImage` |
-            | Android (arm64 + x86_64) | `anon_*_universal.apk` |
+            | Android (arm64 + x86_64) | `app-universal-release-unsigned.apk` |
 
             Verify a download against `SHA256SUMS.txt` before running it.
 

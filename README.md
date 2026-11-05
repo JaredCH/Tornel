@@ -490,11 +490,12 @@ Four Android-specific notes:
   `keyring-core` itself. The seed is still never written to a plaintext file, and an
   unavailable Keystore still blocks the app rather than degrading.
 
-The release workflow produces an **unsigned** APK, because the generated Gradle
-project has no release signing config and a keystore is a long-lived secret that CI
-must not invent. To distribute it, add a `signingConfigs.release` block to
-`gen/android/app/build.gradle.kts` and supply the keystore through repository
-secrets; until then, sign the artifact yourself with `apksigner` before installing.
+The release workflow produces an **unsigned** APK named
+`app-universal-release-unsigned.apk`, because the generated Gradle project has no release
+signing config and a keystore is a long-lived secret that CI must not invent. To distribute
+it, add a `signingConfigs.release` block to `gen/android/app/build.gradle.kts` and supply
+the keystore through repository secrets; until then, sign the artifact yourself with
+`apksigner` before installing.
 
 ### Releasing
 
