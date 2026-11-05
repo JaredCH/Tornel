@@ -1246,3 +1246,468 @@ button.small-btn {
 .ok { color: var(--ok); }
 #welcome-hex, #my-key-package { width: 100%; font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
 #group-detail-id { overflow-wrap: anywhere; }
+
+/* ---- Mobile-only affordances (hidden on desktop) ---- */
+
+.mobile-back-btn { display: none; }
+.drawer-mobile-bar { display: none; }
+
+/* ===========================================================================
+   Phones / small screens
+   ===========================================================================
+
+   The desktop layout is a fixed two-pane grid, which cannot fit a phone: the
+   340px sidebar alone is wider than the viewport, so the chat pane was pushed
+   off-screen entirely. Below 760px the app becomes a single pane that swaps
+   between the chat list and the open chat, driven by `data-mobile-view` on
+   #app (set from main.js).
+
+   Everything here is additive — the desktop rules above are untouched.
+   =========================================================================== */
+
+@media (max-width: 760px), (max-height: 500px) and (max-width: 950px) {
+  /* --- Shell: one pane at a time --- */
+
+  #app {
+    grid-template-columns: 1fr;
+    height: 100vh;
+    height: 100dvh;
+    width: 100%;
+    max-width: 100%;
+  }
+
+  #app[data-mobile-view="list"] .chat-workspace { display: none; }
+  #app[data-mobile-view="chat"] .sidebar { display: none; }
+
+  .sidebar {
+    border-right: 0;
+    width: 100%;
+  }
+
+  .chat-workspace {
+    width: 100%;
+    min-height: 0;
+  }
+
+  /* --- Sidebar: reclaim vertical space, respect the notch --- */
+
+  .sidebar-header {
+    padding: calc(10px + env(safe-area-inset-top)) 12px 8px;
+  }
+
+  .sidebar-actions {
+    grid-template-columns: repeat(3, 1fr);
+    gap: 5px;
+    padding: 8px 12px;
+  }
+
+  .sidebar-btn {
+    padding: 9px 4px;
+    font-size: 11px;
+    line-height: 1.25;
+  }
+
+  .sidebar-filter { padding: 8px 12px 4px; }
+
+  .sidebar-lists {
+    padding: 2px 8px 10px;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+  }
+
+  .sidebar-footer {
+    padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
+  }
+
+  .quick-share-bar { flex-wrap: wrap; }
+
+  .action-chip {
+    flex: 1 1 auto;
+    min-height: 34px;
+    padding: 7px 8px;
+  }
+
+  /* Comfortable tap targets in the chat list. */
+  .chat-list li { padding: 11px 10px; }
+  .chat-list .item-avatar { width: 40px; height: 40px; }
+
+  /* --- Chat header: back button, wrapping, fewer badges --- */
+
+  .mobile-back-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    font-size: 18px;
+    line-height: 1;
+    flex: none;
+    border-radius: 10px;
+  }
+
+  .chat-header {
+    padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+    gap: 8px;
+    align-items: flex-start;
+    flex: none;
+  }
+
+  .chat-header-left {
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .chat-header .avatar {
+    width: 34px;
+    height: 34px;
+    font-size: 13px;
+  }
+
+  .chat-title-row h2 {
+    font-size: 15px;
+    overflow-wrap: anywhere;
+  }
+
+  /* The TTL / E2EE badges and the long conversation id are noise on a phone. */
+  .chat-title-row .ttl-badge,
+  .chat-subtitle-row .conv-id { display: none; }
+
+  .chat-subtitle-row {
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    font-size: 10px;
+  }
+
+  .chat-header-actions { flex: none; }
+
+  .chat-header-actions .small-btn {
+    padding: 7px 9px;
+    font-size: 11px;
+    white-space: normal;
+    max-width: 96px;
+    line-height: 1.2;
+  }
+
+  /* --- Route bar: compact two-column grid instead of three stacked fields --- */
+
+  .route-bar {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: 6px 8px;
+    padding: 8px 12px;
+    flex: none;
+  }
+
+  .route-bar label {
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  .route-bar input[type="text"],
+  .route-bar input[type="number"] {
+    width: 100%;
+    min-width: 0;
+    flex: none;
+    padding: 7px 9px;
+    font-size: 13px;
+  }
+
+  /* --- Message stream --- */
+
+  .messages-scroll {
+    padding: 12px 12px 8px;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+  }
+
+  .msg-row { max-width: 86%; }
+
+  .msg-bubble { padding: 9px 12px; }
+
+  .msg-text { font-size: 15px; }
+
+  .msg-attachment img {
+    max-width: 100%;
+    max-height: 220px;
+  }
+
+  /* --- Composer: thumb-friendly, above the home indicator --- */
+
+  .chat-composer {
+    gap: 8px;
+    padding: 8px 12px 4px;
+    flex: none;
+  }
+
+  .composer-icon-btn {
+    width: 42px;
+    height: 42px;
+    font-size: 18px;
+  }
+
+  .chat-composer textarea {
+    min-height: 42px;
+    max-height: 96px;
+    padding: 10px 12px;
+    /* 16px keeps iOS/Android from zooming the page on focus. */
+    font-size: 16px;
+  }
+
+  .send-btn {
+    height: 42px;
+    padding: 0 14px;
+    font-size: 14px;
+  }
+
+  .composer-status-bar {
+    padding: 2px 14px calc(6px + env(safe-area-inset-bottom));
+    flex: none;
+    min-height: 24px;
+  }
+
+  /* The crypto footnote is decoration; the send result is not. */
+  .composer-security-hint { display: none; }
+
+  .attachment-staging { padding: 8px 12px; }
+
+  /* --- Group drawer: full-screen overlay instead of a side panel --- */
+
+  .group-drawer {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    max-width: none;
+    z-index: 60;
+    border-left: 0;
+    padding: 0 12px calc(16px + env(safe-area-inset-bottom));
+    gap: 10px;
+    background: var(--sidebar-bg);
+  }
+
+  .drawer-mobile-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    margin: 0 -12px 4px;
+    padding: calc(10px + env(safe-area-inset-top)) 14px 10px;
+    background: var(--sidebar-bg);
+    border-bottom: 1px solid var(--line);
+    font-size: 14px;
+    font-weight: 700;
+  }
+
+  .drawer-mobile-bar .small-btn {
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    font-size: 18px;
+    line-height: 1;
+  }
+
+  /* --- Empty state --- */
+
+  .chat-empty-state { padding: 16px; }
+
+  .empty-card {
+    padding: 22px 18px;
+    border-radius: 14px;
+  }
+
+  .empty-card h2 { font-size: 16px; }
+
+  .empty-actions { flex-direction: column; }
+
+  .empty-actions button { width: 100%; }
+
+  /* --- Modals: full screen, scrollable --- */
+
+  .modal-backdrop {
+    padding: 0;
+    align-items: stretch;
+    backdrop-filter: none;
+  }
+
+  .modal-card,
+  .modal-card.modal-wide {
+    max-width: none;
+    max-height: none;
+    height: 100%;
+    border-radius: 0;
+    border: 0;
+    padding: calc(16px + env(safe-area-inset-top)) 16px
+             calc(16px + env(safe-area-inset-bottom));
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+  }
+
+  .modal-header {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--panel);
+    padding-bottom: 10px;
+    margin-bottom: 10px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .modal-header h2 { font-size: 15px; }
+
+  .modal-close {
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    font-size: 18px;
+    line-height: 1;
+    flex: none;
+  }
+
+  .modal-footer { flex-wrap: wrap; }
+  .modal-footer button { flex: 1 1 auto; }
+
+  /* --- Launch screen --- */
+
+  .launch { padding: 12px; }
+
+  .launch-card {
+    padding: 20px 16px;
+    border-radius: 14px;
+  }
+
+  .brand-hero { gap: 10px; margin-bottom: 16px; }
+  .brand-hero h1 { font-size: 20px; }
+  .subtitle { font-size: 11px; }
+
+  /* --- Shared controls --- */
+
+  /* 16px prevents the mobile browser from zooming on focus. */
+  input,
+  textarea,
+  select,
+  .persona-controls select {
+    font-size: 16px;
+  }
+
+  button { min-height: 40px; }
+  button.small-btn { min-height: 34px; }
+
+  .row { flex-wrap: wrap; }
+  .row > input { flex: 1 1 100%; }
+  .row > input[type="number"] { flex: 1 1 100%; }
+  .row > button { flex: 1 1 auto; }
+
+  /* Key/value pairs read better stacked than in two columns on a phone. */
+  .kv {
+    grid-template-columns: 1fr;
+    gap: 2px 0;
+  }
+
+  .kv dt { margin-top: 8px; }
+  .kv dd { flex-wrap: wrap; }
+
+  .code-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .code-row button { width: 100%; }
+
+  code { font-size: 11px; }
+
+  .card { padding: 14px; }
+
+  .prompt-text { padding: 11px 13px; font-size: 13px; }
+}
+
+/* ===========================================================================
+   Tablets / narrow windows (761px–1024px)
+   ===========================================================================
+
+   The desktop two-pane layout still applies here, but a fixed 340px sidebar
+   leaves too little room for the conversation. Narrow the sidebar and let the
+   chat header wrap instead of squeezing its badges.
+   =========================================================================== */
+
+@media (min-width: 761px) and (max-width: 1024px) {
+  #app { grid-template-columns: 264px 1fr; }
+
+  .sidebar-header { padding: 12px 12px 8px; }
+  .sidebar-actions { padding: 8px 12px; gap: 5px; }
+  .sidebar-btn { padding: 7px 4px; font-size: 11px; }
+  .sidebar-filter { padding: 8px 12px 4px; }
+  .sidebar-lists { padding: 2px 8px 10px; }
+  .sidebar-footer { padding: 8px 12px; }
+
+  .quick-share-bar { flex-wrap: wrap; }
+  .action-chip { flex: 1 1 auto; }
+
+  .chat-header { padding: 10px 14px; }
+  .chat-header-actions .small-btn { white-space: normal; max-width: 110px; line-height: 1.2; }
+
+  .messages-scroll { padding: 16px 16px; }
+  .msg-row { max-width: 80%; }
+
+  .chat-composer { padding: 10px 14px 4px; }
+  .composer-status-bar { padding: 2px 16px 8px; }
+
+  .group-drawer { width: 260px; }
+
+  .modal-card { max-width: 460px; }
+  .modal-card.modal-wide { max-width: 560px; }
+}
+
+/* Very narrow phones (e.g. 320–360px): tighten the sidebar chrome further. */
+@media (max-width: 380px) {
+  .sidebar-btn { font-size: 10px; padding: 8px 2px; }
+  .action-chip { font-size: 11px; }
+  .chat-header-actions .small-btn { max-width: 76px; font-size: 10px; }
+  .msg-row { max-width: 92%; }
+}
+
+/* Landscape phones: the launch card must scroll rather than clip. */
+@media (max-height: 480px) and (max-width: 900px) {
+  .launch { align-items: flex-start; }
+  .launch-card { margin: 0 auto; }
+}
+
+/* Landscape phones: vertical space is the scarce resource, so trim the chrome. */
+@media (max-height: 500px) and (max-width: 950px) {
+  .chat-header {
+    padding: calc(4px + env(safe-area-inset-top)) 12px 4px;
+  }
+
+  .chat-header .avatar { width: 28px; height: 28px; font-size: 12px; }
+
+  .chat-subtitle-row { display: none; }
+
+  .chat-composer { padding: 6px 12px 2px; }
+
+  .chat-composer textarea { min-height: 36px; max-height: 64px; padding: 7px 12px; }
+
+  .composer-icon-btn,
+  .send-btn { height: 36px; }
+
+  .composer-status-bar { min-height: 0; padding: 0 14px calc(4px + env(safe-area-inset-bottom)); }
+
+  .sidebar-header { padding: calc(6px + env(safe-area-inset-top)) 12px 6px; }
+
+  .sidebar-actions { padding: 6px 12px; }
+
+  .sidebar-btn { padding: 6px 4px; }
+
+  .sidebar-filter { padding: 6px 12px 2px; }
+
+  .sidebar-footer { padding: 6px 12px calc(6px + env(safe-area-inset-bottom)); }
+
+  .modal-card,
+  .modal-card.modal-wide {
+    padding: calc(10px + env(safe-area-inset-top)) 16px
+             calc(10px + env(safe-area-inset-bottom));
+  }
+}
+

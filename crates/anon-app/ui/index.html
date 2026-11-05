@@ -140,7 +140,7 @@
     </div>
 
     <!-- Main Messenger Shell (SimpleX / Signal inspired 2-pane layout) -->
-    <div id="app" hidden>
+    <div id="app" data-mobile-view="list" hidden>
       <!-- Left Sidebar -->
       <aside class="sidebar">
         <!-- Top Profile & Tor Status Card -->
@@ -249,6 +249,7 @@
         <section id="conversation-detail" class="chat-pane" hidden>
           <header class="chat-header">
             <div class="chat-header-left">
+              <button class="mobile-back-btn ghost" data-mobile-back aria-label="Back to chats" title="Back to chats">←</button>
               <div class="avatar peer-avatar" id="chat-header-avatar">P</div>
               <div class="chat-header-info">
                 <div class="chat-title-row">
@@ -257,7 +258,7 @@
                   <span class="ttl-badge" title="Mandatory 90-day local SQLCipher auto-purge">⏱️ 90d TTL</span>
                 </div>
                 <div class="chat-subtitle-row">
-                  <span>Conv ID: <code id="conversation-detail-id" class="inline-code"></code></span>
+                  <span class="conv-id">Conv ID: <code id="conversation-detail-id" class="inline-code"></code></span>
                   <span id="chat-header-onion-status" class="peer-route-pill"></span>
                 </div>
               </div>
@@ -320,6 +321,7 @@
         <section id="group-detail" class="chat-pane group-pane" hidden>
           <header class="chat-header">
             <div class="chat-header-left">
+              <button class="mobile-back-btn ghost" data-mobile-back aria-label="Back to chats" title="Back to chats">←</button>
               <div class="avatar group-avatar">#</div>
               <div class="chat-header-info">
                 <div class="chat-title-row">
@@ -383,6 +385,10 @@
 
             <!-- Right Drawer: Members, Roles, Add/Remove -->
             <aside id="group-drawer" class="group-drawer">
+              <div class="drawer-mobile-bar">
+                <span>Group Settings</span>
+                <button class="ghost small-btn" data-close-drawer aria-label="Close group settings">×</button>
+              </div>
               <div class="drawer-section">
                 <h3>Members &amp; Roles</h3>
                 <p class="hint small">

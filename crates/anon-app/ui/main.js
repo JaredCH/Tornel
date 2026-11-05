@@ -72,6 +72,66 @@ function clearError(target) {
   target.classList.remove("error");
 }
 
+// ---------------------------------------------------------------------------
+// Mobile navigation
+//
+// On a phone the two-pane layout cannot fit, so the app shows one pane at a
+// time. `data-mobile-view` on #app is the single source of truth: "list" shows
+// the sidebar, "chat" shows the active conversation or group. Desktop ignores
+// the attribute entirely (see the media queries in style.css).
+// ---------------------------------------------------------------------------
+
+/** True when the viewport is narrow enough to use the single-pane layout. */
+function isMobileLayout() {
+  // Must stay in sync with the media query in style.css: portrait phones and
+  // small tablets by width, plus landscape phones which are wide but very short.
+  return window.matchMedia(
+    "(max-width: 760px), (max-height: 500px) and (max-width: 950px)"
+  ).matches;
+}
+
+/** Switch the mobile layout between the chat list and the open chat. */
+function setMobileView(view) {
+  const app = $("app");
+  if (app) app.dataset.mobileView = view;
+}
+
+/** Return to the chat list, closing any open chat and its drawer. */
+function showMobileList() {
+  setMobileView("list");
+  const drawer = $("group-drawer");
+  if (drawer) drawer.hidden = true;
+}
+
+/**
+ * Use shorter composer placeholders on smaller screens.
+ *
+ * The desktop hints spell out the Enter/Shift+Enter behaviour, which does not fit
+ * in a two-line textarea on a narrow screen and gets clipped mid-word.
+ */
+function applyComposerPlaceholders() {
+  const mobile = isMobileLayout();
+  // Below the desktop width the textarea is too narrow for the full hint even
+  // though the two-pane layout still applies (tablets, narrow windows).
+  const compact = mobile || window.matchMedia("(max-width: 1024px)").matches;
+  const body = $("body");
+  const groupBody = $("group-body");
+  if (body) {
+    body.placeholder = mobile
+      ? "Encrypted message…"
+      : compact
+        ? "Encrypted message… (Enter to send)"
+        : "Write an encrypted message… (Enter to send, Shift+Enter for newline)";
+  }
+  if (groupBody) {
+    groupBody.placeholder = mobile
+      ? "Message group…"
+      : compact
+        ? "Message group… (Enter to send)"
+        : "Message group (MLS-encrypted & Tor-routed)… (Enter to send)";
+  }
+}
+
 /** Format epoch seconds as a short local date. */
 function when(epochSeconds) {
   if (!epochSeconds) return "—";
@@ -179,6 +239,8 @@ function renderLaunch(view) {
 function enterApp() {
   launch.root().hidden = true;
   $("app").hidden = false;
+  // Always land on the chat list on a phone; the desktop layout shows both panes.
+  setMobileView("list");
   // Start the display refresh loops now rather than at DOMContentLoaded: while locked,
   // every command returns a `locked` error and the status line would fill with noise.
   startRefreshLoops();
@@ -783,6 +845,7 @@ async function selectConversation(conversationId, labelText, explicitOnion) {
   $("group-detail").hidden = true;
   const detail = $("conversation-detail");
   detail.hidden = false;
+  setMobileView("chat");
 
   const title = labelText || "Direct Chat";
   $("conversation-detail-title").textContent = title;
@@ -827,7 +890,10 @@ function updateHeaderOnionPill() {
     $("route-bar").hidden = true;
   } else {
     pill.textContent = "⚠️ Set peer .onion route to send";
-    $("route-bar").hidden = false;
+    // On a phone the three-field route bar would take a third of the screen, so
+    // leave it collapsed and let the warning pill plus the "Route / .onion"
+    // button lead the user to it.
+    $("route-bar").hidden = isMobileLayout();
   }
 }
 
@@ -1094,7 +1160,15 @@ async function refreshConversations() {
     renderConversationsList();
     await refreshPeers();
 
-    if (!selectedConversationId && !selectedGroupId && cachedConversations.length >= 1) {
+    // Auto-opening the first conversation is a desktop convenience. On a phone it
+    // would skip past the chat list the user just landed on, so leave the choice
+    // to them.
+    if (
+      !isMobileLayout() &&
+      !selectedConversationId &&
+      !selectedGroupId &&
+      cachedConversations.length >= 1
+    ) {
       const first = cachedConversations[0];
       const matchedPeer = findPeerForConversation(first);
       const parsed = matchedPeer ? splitLabelAndOnion(matchedPeer.onion_short) : { onion: null };
@@ -1246,6 +1320,13 @@ async function selectGroup(groupId) {
   $("conversation-detail").hidden = true;
   const detail = $("group-detail");
   detail.hidden = false;
+  setMobileView("chat");
+  // The members drawer is a side panel on desktop but a full-screen overlay on a
+  // phone, so it must start closed rather than covering the conversation.
+  if (isMobileLayout()) {
+    const drawer = $("group-drawer");
+    if (drawer) drawer.hidden = true;
+  }
 
   clearError($("add-member-result"));
   clearError($("remove-member-result"));
@@ -1264,6 +1345,7 @@ async function selectGroup(groupId) {
     if (!g) {
       detail.hidden = true;
       selectedGroupId = null;
+      setMobileView("list");
       $("status-line").textContent = "that group no longer exists";
       return;
     }
@@ -1984,6 +2066,44 @@ window.addEventListener("DOMContentLoaded", async () => {
         sendGroupMessage();
       }
     }
+  });
+
+  // Mobile: back out of an open chat, and close the group drawer overlay.
+  document.querySelectorAll("[data-mobile-back]").forEach((btn) => {
+    btn.addEventListener("click", showMobileList);
+  });
+  document.querySelectorAll("[data-close-drawer]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const drawer = $("group-drawer");
+      if (drawer) drawer.hidden = true;
+    });
+  });
+  // Escape is the keyboard equivalent of the back button on a phone.
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || !isMobileLayout()) return;
+    const drawer = $("group-drawer");
+    if (drawer && !drawer.hidden) {
+      drawer.hidden = true;
+      return;
+    }
+    if ($("app").dataset.mobileView === "chat") showMobileList();
+  });
+
+  // Crossing the breakpoint changes what "hidden" means for the group drawer: it is
+  // a persistent side panel on desktop and an overlay on a phone. Restore the
+  // desktop default when growing, and close the overlay when shrinking.
+  let wasMobile = isMobileLayout();
+  applyComposerPlaceholders();
+  window.addEventListener("resize", () => {
+    const nowMobile = isMobileLayout();
+    // The placeholder also changes at the tablet breakpoint, so refresh it on any
+    // resize rather than only when the mobile layout flips.
+    applyComposerPlaceholders();
+    if (nowMobile === wasMobile) return;
+    wasMobile = nowMobile;
+    const drawer = $("group-drawer");
+    if (!drawer) return;
+    drawer.hidden = nowMobile;
   });
 
   // Launch screen wiring

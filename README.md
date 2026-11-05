@@ -699,6 +699,43 @@ with no message. The three production `Mutex::lock().unwrap()` sites are now
 poison-tolerant, so a panic in one command cannot turn into a permanently
 unusable app in debug and test builds.
 
+### Why the mobile UI was broken, and what fixed it
+
+The webview was written for a desktop window and never adapted. `#app` was a
+hard-coded `grid-template-columns: 340px 1fr` with **no media queries anywhere in
+`style.css`**, so on a phone the sidebar alone was wider than the viewport and the
+conversation pane was pushed entirely off-screen. There was also no way back: once
+a chat was open, nothing in the UI returned to the list.
+
+The layout is now responsive in three layers, all additive — the desktop rules are
+untouched:
+
+| Width | Layout |
+| --- | --- |
+| ≤ 760px, or landscape ≤ 950×500 | Single pane; `data-mobile-view` on `#app` swaps list ↔ chat |
+| 761–1024px | Two panes, sidebar narrowed 340px → 264px |
+| ≤ 380px | Extra tightening for small phones |
+
+`isMobileLayout()` in `main.js` mirrors the media query exactly, so the JS and CSS
+never disagree about which layout is active. A back button in both chat headers and
+the Escape key return to the list; the group members drawer becomes a full-screen
+overlay instead of a side panel.
+
+Two bugs surfaced while testing the result at real device sizes:
+
+- **The composer was being flex-shrunk.** The status bar rendered at 18px instead of
+  the 24px its text needs, clipping the send result. The header, composer, and status
+  bar now carry `flex: none`.
+- **The route bar auto-expanded and ate 186px.** On a 390×844 phone that left 509px
+  for messages. It now stays collapsed on mobile — the header pill still warns when a
+  peer `.onion` is missing — recovering 690px of message area.
+
+Verified by rendering the real UI in Chromium with a stubbed Tauri bridge at
+320×640, 390×844, 667×375, 844×390, 768×1024, 1024×768, and 1280×800: no JS errors,
+no horizontal overflow at any size, and the 1280px desktop layout is unchanged.
+Mobile also gets `100dvh`, `env(safe-area-inset-*)` for notches and the home
+indicator, 16px inputs so iOS does not zoom on focus, and 40px+ tap targets.
+
 ### The app starts locked, and that is the point
 
 The user-held passphrase changed startup structurally. The app no longer opens its
