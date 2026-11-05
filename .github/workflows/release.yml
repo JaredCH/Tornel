@@ -260,7 +260,15 @@ jobs:
             BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
           fi
 
-          VERSION="$(grep -m1 '^version' crates/anon-app/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          # The crate inherits its version from the workspace (`version.workspace = true`),
+          # so read the workspace manifest. Reading the crate manifest yields the literal
+          # string "version.workspace = true", which is how v0.1.5 shipped an artifact
+          # named `anon_version.workspace.true_universal.apk`.
+          VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not read the workspace version from Cargo.toml"
+            exit 1
+          fi
           UNSIGNED="$(find crates/anon-app/gen/android/app/build/outputs/apk -name '*.apk' | head -1)"
           if [ -z "$UNSIGNED" ]; then
             echo "::error::no APK produced by the build"
