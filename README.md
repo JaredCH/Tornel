@@ -736,6 +736,36 @@ no horizontal overflow at any size, and the 1280px desktop layout is unchanged.
 Mobile also gets `100dvh`, `env(safe-area-inset-*)` for notches and the home
 indicator, 16px inputs so iOS does not zoom on focus, and 40px+ tap targets.
 
+### Why the Android build had no Tor, and why invites failed
+
+Two independent defects, both shipped in v0.1.6.
+
+**1. The APK was built without the Tor backend.** The release workflow passed
+`--features tor` to the Windows and Linux builds but not to
+`tauri android build`. Without that feature `anon-app` compiles the fail-closed
+`OfflineTransport`, whose `local_onion()` is always `None` and whose status is
+always `Failed`. The APK therefore had no Arti in it at all: the UI sat on
+"starting embedded Arti Tor…" forever, and "Share My Invite" could never succeed
+because `export_invite` refuses without an onion address. The Android job now
+passes the same flag as the desktop jobs.
+
+The UI also made this indistinguishable from a slow bootstrap. `refreshTransport`
+rendered "starting embedded Arti Tor…" whenever there was no onion, regardless of
+whether the transport was still bootstrapping or had already failed. It now
+reports a failed transport as failed, so the banner's reason is visible instead of
+being masked by a progress message that never advances.
+
+**2. A signed invite with a `#label` suffix was rejected.** `parseInviteInput`
+checked for the `tornel1:` prefix *before* stripping the trailing `#label`, so
+`tornel1:{...}#Alice` was handed to the backend whole. The backend then failed to
+parse it as JSON and reported "invalid signed invitation". The label is now
+stripped first, and the prefix check runs on what remains.
+
+`crates/anon-ipc/tests/invite.rs` covers the round trip that had no test before:
+a bundle one backend exports is accepted by another, the saved peer carries the
+inviter's onion, a tampered bundle is refused on the signature, a bare contact
+code still works, and `export_invite` refuses without an onion.
+
 ### The app starts locked, and that is the point
 
 The user-held passphrase changed startup structurally. The app no longer opens its

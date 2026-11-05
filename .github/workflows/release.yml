@@ -223,8 +223,13 @@ jobs:
       # `apksigner` rather than through a `signingConfigs.release` block, because the
       # Gradle project is generated (gitignored) and patching it on every run is more
       # fragile than signing the finished artifact.
+      # `--features tor` is not optional here. Without it `anon-app` compiles the
+      # fail-closed `OfflineTransport`, whose `local_onion()` is always `None` — so the
+      # APK ships with no Tor backend at all and the UI sits on "starting embedded Arti
+      # Tor…" forever. v0.1.6 shipped exactly that. The desktop jobs pass the same flag;
+      # Android was the one target that did not.
       - name: Build APK
-        run: npx --yes @tauri-apps/cli@^2 android build --apk --ci
+        run: npx --yes @tauri-apps/cli@^2 android build --apk --features tor --ci
         working-directory: crates/anon-app
 
       # An unsigned APK cannot be installed at all: Android rejects it with

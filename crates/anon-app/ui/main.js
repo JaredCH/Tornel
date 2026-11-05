@@ -515,13 +515,22 @@ async function refreshTransport() {
     }
 
     selfOnionAddress = view.local_onion ?? "";
-    $("status-line").textContent = view.local_onion_short
-      ? view.can_send
+    // A failed transport has no onion and never will, so reporting "starting…" would
+    // describe a state the app is not in and never leaves. That is exactly how a build
+    // with no Tor backend (the v0.1.6 APK) looked like a slow bootstrap forever.
+    if (view.local_onion_short) {
+      $("status-line").textContent = view.can_send
         ? `${view.local_onion_short}….onion (online)`
-        : `${view.local_onion_short}….onion (publishing…)`
-      : "starting embedded Arti Tor…";
+        : `${view.local_onion_short}….onion (publishing…)`;
+    } else if (view.status === "failed") {
+      $("status-line").textContent = "Tor unavailable — see the banner";
+    } else {
+      $("status-line").textContent = "starting embedded Arti Tor…";
+    }
     if ($("local-onion")) {
-      $("local-onion").textContent = view.local_onion ?? "waiting for Tor bootstrap…";
+      $("local-onion").textContent =
+        view.local_onion ??
+        (view.status === "failed" ? "Tor unavailable" : "waiting for Tor bootstrap…");
     }
     updateInviteBundleDisplay();
   } catch (err) {
@@ -680,8 +689,11 @@ function splitLabelAndOnion(stored) {
 /** Parse a pasted invite string like `anon1...@xyz.onion#Alice` into { code, onion, label }. */
 function parseInviteInput(raw) {
   let text = (raw || "").trim();
-  if (text.startsWith("tornel1:")) return { code: text, onion: null, label: null, signed: true };
   let label = null;
+  // The label suffix is stripped before the signed-invite check. A signed bundle is
+  // JSON, so it can legitimately contain `#`; but a trailing `#label` is appended by
+  // the user, and checking for the prefix first meant `tornel1:{...}#Alice` was passed
+  // to the backend whole and rejected as an invalid invitation.
   const hashIdx = text.indexOf("#");
   if (hashIdx !== -1) {
     try {
@@ -691,6 +703,7 @@ function parseInviteInput(raw) {
     }
     text = text.slice(0, hashIdx).trim();
   }
+  if (text.startsWith("tornel1:")) return { code: text, onion: null, label, signed: true };
   const atIdx = text.indexOf("@");
   if (atIdx !== -1) {
     const code = text.slice(0, atIdx).trim();
