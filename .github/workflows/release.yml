@@ -148,10 +148,21 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libssl-dev perl file
 
+      # The workspace pins its toolchain in `rust-toolchain.toml` (1.92.0), and rustup
+      # honours that pin over the `stable` this action installs. The Android targets must
+      # therefore be added to the *pinned* toolchain, not to stable — otherwise the build
+      # fails with "can't find crate for `core`" because the pinned toolchain has no
+      # Android std.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Add Android targets to the pinned toolchain
+        run: |
+          rustup target add \
+            aarch64-linux-android \
+            armv7-linux-androideabi \
+            i686-linux-android \
+            x86_64-linux-android
 
       - name: Set up JDK
         uses: actions/setup-java@v4
